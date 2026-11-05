@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+myenv/
+.pytest_cache/
+data/
+logs/
+reports/
+scan_output.txt

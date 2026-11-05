@@ -1,0 +1,31 @@
+BSS 02:00:00:00:00:01(on wlan0)
+	freq: 2412
+	signal: -54.00 dBm
+	capability: ESS Privacy (0x0011)
+	SSID: Example Home
+	RSN: * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+BSS 02:00:00:00:00:02(on wlan0)
+	freq: 5180
+	signal: -66.00 dBm
+	capability: ESS Privacy (0x0011)
+	SSID: Example Modern
+	RSN: * Version: 1
+		 * Group cipher: CCMP
+		 * Authentication suites: PSK SAE
+BSS 02:00:00:00:00:03(on wlan0)
+	freq: 2412
+	signal: -78.00 dBm
+	capability: ESS (0x0001)
+	SSID: SAE Guest
+BSS 02:00:00:00:00:04(on wlan0)
+	freq: 5955
+	signal: -61.00 dBm
+	capability: ESS Privacy (0x0011)
+	SSID:
+	Supported rates: 6.0 12.0 24.0
+	RSN: * Version: 1
+		 * Group cipher: CCMP
+		 * Authentication suites: SAE

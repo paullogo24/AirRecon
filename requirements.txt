@@ -1,2 +1,1 @@
-scapy
-tabulate
+# No third-party Python packages are required. Live scans use the system iw command.
