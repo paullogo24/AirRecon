@@ -245,7 +245,11 @@ cd /path/to/AirRecon
 python3 -m unittest discover -s tests -v
 ```
 
-Tests use synthetic scan output, temporary directories, and mocked `iw` calls. They cover
-parsing, configuration warnings, sorting, shared-name analysis, failure recovery, storage, sudo file ownership, input
-validation, filtering, CSV export, non-interactive mode, and a complete offline menu session. They do not run wireless scans. Live scanning still depends on your
-adapter, driver, privileges, and environment.
+Tests use synthetic scan output, an anonymised real scan, temporary directories, and
+mocked `iw` calls. `tests/fixtures/real_scan.txt` is a 16-network `iw` 6.17 scan with
+network names, MAC addresses, WPS device details, and the country code replaced; a test
+checks that no identifying values remain. They cover parsing, configuration warnings,
+sorting, shared-name analysis, failure recovery, storage, sudo file ownership, input
+validation, filtering, CSV export, non-interactive mode, and a complete offline menu
+session. They do not run wireless scans. Live scanning still depends on your adapter,
+driver, privileges, and environment.

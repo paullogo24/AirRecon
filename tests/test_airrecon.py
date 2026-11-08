@@ -3,6 +3,8 @@ import contextlib
 import csv
 import io
 import json
+import re
+from collections import Counter
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +17,8 @@ import AirRecon as app
 
 FIXTURE = Path(__file__).parent / 'fixtures' / 'sample_scan.txt'
 TWIN_FIXTURE = Path(__file__).parent / 'fixtures' / 'twin_scan.txt'
+# A real iw 6.17 scan (16 networks), anonymised: names, MACs, WPS identity, country.
+REAL_FIXTURE = Path(__file__).parent / 'fixtures' / 'real_scan.txt'
 
 
 class AirReconTests(unittest.TestCase):
@@ -616,6 +620,79 @@ class AirReconTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Network names shared by several access points', result.stdout)
         self.assertIn('evil-twin', result.stdout)
+
+
+class RealScanTests(unittest.TestCase):
+    """Parser behaviour on real-world iw output rather than hand-written samples."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.raw = REAL_FIXTURE.read_text(encoding='utf-8')
+        cls.networks = app.parse_scan_output(cls.raw)
+
+    def test_every_bss_is_parsed_with_core_fields(self):
+        self.assertEqual(len(self.networks), self.raw.count('\nBSS ') + self.raw.startswith('BSS '))
+        self.assertEqual(len(self.networks), 16)
+        self.assertEqual(len({n['BSSID'] for n in self.networks}), 16)
+        for net in self.networks:
+            with self.subTest(bssid=net['BSSID']):
+                self.assertIsNotNone(net['Channel'])
+                self.assertIsNotNone(net['Signal (dBm)'])
+                self.assertRegex(net['Frequency'], r'^\d\.\d{3} GHz$')
+
+    def test_associated_suffix_and_decimal_frequency(self):
+        # Real output: 'BSS <mac>(on wlo1) -- associated' and 'freq: 5500.0'.
+        first = self.networks[0]
+        self.assertEqual(first['BSSID'], '02:00:00:00:10:01')
+        self.assertEqual(first['ESSID'], 'Network A')
+        self.assertEqual(first['Frequency'], '5.500 GHz')
+        self.assertEqual(first['Channel'], '100')
+
+    def test_hidden_networks(self):
+        self.assertEqual(sum(not n['ESSID'] for n in self.networks), 5)
+
+    def test_security_labels_and_details(self):
+        count = lambda key: sorted(Counter(str(n[key]) for n in self.networks).items())
+        self.assertEqual(count('Encryption'), [('Open', 2), ('WPA2', 9),
+                                               ('WPA2/3-Enterprise', 2), ('WPA2/WPA3', 3)])
+        self.assertEqual(count('PMF'), [('Disabled', 9), ('None', 2), ('Optional', 5)])
+        self.assertEqual(sum(n['WPS'] for n in self.networks), 2)
+        self.assertFalse(any('TKIP' in f"{n['Group Cipher']} {n['Pairwise Ciphers']}"
+                             for n in self.networks))
+
+    def test_bands_and_channel_counts(self):
+        self.assertEqual(sorted(Counter(app.band(n) for n in self.networks).items()),
+                         [('2.4 GHz', 10), ('5 GHz', 6)])
+        self.assertEqual(app.analyze_channels(self.networks),
+                         {'2.412 GHz': 4, '2.437 GHz': 1, '2.462 GHz': 5, '5.200 GHz': 1,
+                          '5.220 GHz': 1, '5.500 GHz': 2, '5.765 GHz': 2})
+
+    def test_real_shared_names_are_not_false_alarms(self):
+        findings = app.name_findings(self.networks)
+        self.assertEqual(findings['warnings'], {})
+        self.assertEqual([(e['level'], len(e['members'])) for e in findings['entries']],
+                         [('info', 2), ('info', 2), ('info', 3)])
+
+    def test_real_warning_totals(self):
+        findings = app.name_findings(self.networks)
+        warnings = Counter(w.split('.')[0] for n in self.networks
+                           for w in app.network_warnings(n, findings))
+        self.assertEqual(warnings, Counter({
+            'No WiFi link encryption is advertised': 2,
+            'Protected management frames (PMF/802': 9,
+            'WPS is advertised': 2}))
+
+    def test_fixture_contains_no_identifying_data(self):
+        self.assertEqual(set(re.findall(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', self.raw)),
+                         {f'02:00:00:00:10:{i:02x}' for i in range(1, 17)})
+        names = set(re.findall(r'^\s*SSID: (.*)$', self.raw, re.MULTILINE))
+        self.assertTrue(all(re.fullmatch(r'Network [A-Z]', name) for name in names), names)
+        for field in ('Device name', 'Manufacturer', 'Model', 'Serial Number', 'UUID'):
+            values = set(re.findall(r'\* ' + field + r':\s*(.*)$', self.raw, re.MULTILINE))
+            with self.subTest(field=field):
+                self.assertTrue(values <= {'Example Router', 'Example Corp', 'Model X',
+                                           '0000000000', '00000000-0000-0000-0000-000000000000'})
+        self.assertEqual(set(re.findall(r'Country: (\S+)', self.raw)), {'XX'})
 
 
 if __name__ == '__main__':
