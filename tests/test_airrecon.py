@@ -1,8 +1,10 @@
 """Regression and offline integration tests; no wireless hardware or sudo needed."""
+import argparse
 import contextlib
 import csv
 import io
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -12,7 +14,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import AirRecon as app
+from airrecon import analysis, cli, display, parser, scanner, storage
 
 
 FIXTURE = Path(__file__).parent / 'fixtures' / 'sample_scan.txt'
@@ -25,11 +27,11 @@ class AirReconTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.addCleanup(app.configure_storage, app.BASE_DIR)
+        self.addCleanup(storage.configure_storage, storage.BASE_DIR)
         self.root = Path(self.directory.name)
-        app.configure_storage(self.root)
+        storage.configure_storage(self.root)
         self.raw = FIXTURE.read_text(encoding='utf-8')
-        self.networks = app.parse_scan_output(self.raw)
+        self.networks = parser.parse_scan_output(self.raw)
         self.console = io.StringIO()
         self.redirect = contextlib.redirect_stdout(self.console)
         self.redirect.__enter__()
@@ -47,7 +49,7 @@ class AirReconTests(unittest.TestCase):
         for name in ('SAE', 'RSN:', 'WPA:', 'Privacy', 'Authentication suites: SAE'):
             with self.subTest(name=name):
                 cell = f'BSS 02:00:00:00:00:01(on wlan0)\n\tSSID: {name}\n\tcapability: ESS (0x0001)\n'
-                self.assertEqual(app.parse_network_info(cell)['Encryption'], 'Open')
+                self.assertEqual(parser.parse_network_info(cell)['Encryption'], 'Open')
 
     def test_security_authentication_modes(self):
         for auth, expected in [('PSK', 'WPA2'), ('SAE', 'WPA3'),
@@ -59,23 +61,23 @@ class AirReconTests(unittest.TestCase):
                                ('unrecognized', 'RSN (unknown authentication)')]:
             with self.subTest(auth=auth):
                 cell = f'\tRSN: * Version: 1\n\t\t * Authentication suites: {auth}\n'
-                self.assertEqual(app.detect_encryption(cell), expected)
-        self.assertEqual(app.detect_encryption('\tWPA: * Version: 1\n'), 'WPA')
-        self.assertEqual(app.detect_encryption('\tcapability: ESS Privacy\n'), 'WEP/unknown')
-        self.assertEqual(app.detect_encryption(''), 'Unknown')
+                self.assertEqual(parser.detect_encryption(cell), expected)
+        self.assertEqual(parser.detect_encryption('\tWPA: * Version: 1\n'), 'WPA')
+        self.assertEqual(parser.detect_encryption('\tcapability: ESS Privacy\n'), 'WEP/unknown')
+        self.assertEqual(parser.detect_encryption(''), 'Unknown')
         mixed = '\tWPA: * Version: 1\n\tRSN: * Version: 1\n\t\t * Authentication suites: PSK\n'
-        self.assertEqual(app.detect_encryption(mixed), 'WPA/WPA2')
+        self.assertEqual(parser.detect_encryption(mixed), 'WPA/WPA2')
 
     def test_empty_and_unrecognized_scan_are_distinct(self):
-        self.assertEqual(app.parse_scan_output(' \n'), [])
-        with self.assertRaises(app.ScanError):
-            app.parse_scan_output('this is not iw scan output')
+        self.assertEqual(parser.parse_scan_output(' \n'), [])
+        with self.assertRaises(parser.ScanError):
+            parser.parse_scan_output('this is not iw scan output')
 
     def test_missing_optional_fields_are_displayable(self):
-        network = app.parse_network_info('BSS 02:00:00:00:00:01(on wlan0)\n')
+        network = parser.parse_network_info('BSS 02:00:00:00:00:01(on wlan0)\n')
         self.assertIsNone(network['Channel'])
         self.assertIsNone(network['Quality(%)'])
-        app.display_results([network])
+        display.display_results([network])
         self.assertIn('(hidden)', self.console.getvalue())
 
     def test_frequency_conversion_and_invalid_values(self):
@@ -83,16 +85,16 @@ class AirReconTests(unittest.TestCase):
                                      (5935, 2), (7115, 233), (4910, 182),
                                      (2413, None), (8000, None), (None, None)]:
             with self.subTest(frequency=frequency):
-                self.assertEqual(app.freq_to_channel(frequency), expected)
+                self.assertEqual(parser.freq_to_channel(frequency), expected)
 
     def test_signal_clamps_and_missing_signal_is_unknown(self):
         for dbm, expected in [(-120, 0), (-100, 0), (-75, 50), (-50, 100), (-20, 100)]:
             cell = f'BSS 02:00:00:00:00:01(on wlan0)\n\tsignal: {dbm} dBm\n'
-            self.assertEqual(app.parse_network_info(cell)['Quality(%)'], expected)
-        self.assertIsNone(app.calculate_signal(None))
+            self.assertEqual(parser.parse_network_info(cell)['Quality(%)'], expected)
+        self.assertIsNone(parser.calculate_signal(None))
 
     def test_channel_counts_do_not_merge_frequency_bands(self):
-        self.assertEqual(app.analyze_channels(self.networks),
+        self.assertEqual(analysis.analyze_channels(self.networks),
                          {'2.412 GHz': 2, '5.180 GHz': 1, '5.955 GHz': 1})
 
     def test_only_wireless_interfaces_are_listed(self):
@@ -100,101 +102,101 @@ class AirReconTests(unittest.TestCase):
             (self.root / name).mkdir()
         (self.root / 'wlan0' / 'wireless').mkdir()
         (self.root / 'wlan1' / 'phy80211').mkdir()
-        with patch.object(app, 'NET_DIR', self.root):
-            self.assertEqual(app.get_wireless_interfaces(), ['wlan0', 'wlan1'])
-        with patch.object(app, 'NET_DIR', self.root / 'absent'):
-            self.assertEqual(app.get_wireless_interfaces(), [])
+        with patch.object(scanner, 'NET_DIR', self.root):
+            self.assertEqual(scanner.get_wireless_interfaces(), ['wlan0', 'wlan1'])
+        with patch.object(scanner, 'NET_DIR', self.root / 'absent'):
+            self.assertEqual(scanner.get_wireless_interfaces(), [])
 
     def test_invalid_interface_selection(self):
         for answer in ('0', '-1', '3', 'abc'):
-            with self.subTest(answer=answer), patch.object(app, 'get_wireless_interfaces', return_value=['wlan0']), patch('builtins.input', return_value=answer):
-                self.assertIsNone(app.choose_interface())
+            with self.subTest(answer=answer), patch.object(scanner, 'get_wireless_interfaces', return_value=['wlan0']), patch('builtins.input', return_value=answer):
+                self.assertIsNone(cli.choose_interface())
 
     def test_scan_success_uses_argument_list_and_saves_raw_output(self):
         result = subprocess.CompletedProcess([], 0, self.raw, '')
-        with patch.object(app.subprocess, 'run', return_value=result) as run:
-            self.assertEqual(app.scan_wifi('wlan0'), self.networks)
+        with patch.object(subprocess, 'run', return_value=result) as run:
+            self.assertEqual(scanner.scan_wifi('wlan0'), self.networks)
         self.assertEqual(run.call_args.args[0], ['iw', 'dev', 'wlan0', 'scan'])
-        self.assertEqual(run.call_args.kwargs['timeout'], app.SCAN_TIMEOUT)
-        self.assertEqual(app.RAW_FILE.read_text(), self.raw)
+        self.assertEqual(run.call_args.kwargs['timeout'], scanner.SCAN_TIMEOUT)
+        self.assertEqual(storage.RAW_FILE.read_text(), self.raw)
 
     def test_scan_errors_are_not_empty_successes(self):
         for error in (FileNotFoundError(), subprocess.TimeoutExpired('iw', 25), PermissionError()):
-            with self.subTest(error=type(error)), patch.object(app.subprocess, 'run', side_effect=error):
-                with self.assertRaises(app.ScanError):
-                    app.scan_wifi('wlan0')
-        with patch.object(app.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'Operation not permitted')):
-            with self.assertRaisesRegex(app.ScanError, 'Operation not permitted'):
-                app.scan_wifi('wlan0')
+            with self.subTest(error=type(error)), patch.object(subprocess, 'run', side_effect=error):
+                with self.assertRaises(parser.ScanError):
+                    scanner.scan_wifi('wlan0')
+        with patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'Operation not permitted')):
+            with self.assertRaisesRegex(parser.ScanError, 'Operation not permitted'):
+                scanner.scan_wifi('wlan0')
 
     def test_raw_output_write_failure_does_not_discard_scan(self):
         result = subprocess.CompletedProcess([], 0, self.raw, '')
-        with patch.object(app.subprocess, 'run', return_value=result), patch.object(app, 'atomic_write', side_effect=PermissionError('read only')):
-            self.assertEqual(app.scan_wifi('wlan0'), self.networks)
+        with patch.object(subprocess, 'run', return_value=result), patch.object(storage, 'atomic_write', side_effect=PermissionError('read only')):
+            self.assertEqual(scanner.scan_wifi('wlan0'), self.networks)
         self.assertIn('Could not save raw scan output', self.console.getvalue())
 
     def test_failed_scan_preserves_memory_and_saved_results(self):
-        app.save_results(self.networks)
-        previous_bytes = app.RESULTS_FILE.read_bytes()
+        storage.save_results(self.networks)
+        previous_bytes = storage.RESULTS_FILE.read_bytes()
         state = {'networks': self.networks}
-        with patch.object(app, 'resolve_interface', return_value='wlan0'), patch.object(app, 'scan_wifi', side_effect=app.ScanError('failed')):
-            app.handle_scan(state)
+        with patch.object(cli, 'resolve_interface', return_value='wlan0'), patch.object(scanner, 'scan_wifi', side_effect=parser.ScanError('failed')):
+            cli.handle_scan(state)
         self.assertIs(state['networks'], self.networks)
-        self.assertEqual(app.RESULTS_FILE.read_bytes(), previous_bytes)
+        self.assertEqual(storage.RESULTS_FILE.read_bytes(), previous_bytes)
         self.assertIn('Previous results were preserved', self.console.getvalue())
         self.assertNotIn('Found 0 networks', self.console.getvalue())
 
     def test_successful_empty_scan_replaces_previous_results(self):
-        app.save_results(self.networks)
+        storage.save_results(self.networks)
         state = {'networks': self.networks}
-        with patch.object(app, 'resolve_interface', return_value='wlan0'), patch.object(app, 'scan_wifi', return_value=[]):
-            app.handle_scan(state)
+        with patch.object(cli, 'resolve_interface', return_value='wlan0'), patch.object(scanner, 'scan_wifi', return_value=[]):
+            cli.handle_scan(state)
         self.assertEqual(state['networks'], [])
-        self.assertEqual(app.load_results(), [])
-        with patch.object(app, 'load_results', side_effect=AssertionError('must not load stale results')):
-            self.assertEqual(app.current_results(state), [])
+        self.assertEqual(storage.load_results(), [])
+        with patch.object(storage, 'load_results', side_effect=AssertionError('must not load stale results')):
+            self.assertEqual(cli.current_results(state), [])
 
     def test_offline_read_error_preserves_results(self):
         state = {'networks': self.networks, 'input_file': self.root / 'missing'}
-        app.handle_scan(state)
+        cli.handle_scan(state)
         self.assertIs(state['networks'], self.networks)
         self.assertIn('Scan failed', self.console.getvalue())
 
     def test_write_failure_keeps_session_results(self):
         state = {'networks': None, 'input_file': FIXTURE}
-        with patch.object(app, 'save_results', side_effect=PermissionError('read only')):
-            app.handle_scan(state)
+        with patch.object(storage, 'save_results', side_effect=PermissionError('read only')):
+            cli.handle_scan(state)
         self.assertEqual(state['networks'], self.networks)
         self.assertIn('remain available in this session', self.console.getvalue())
 
     def test_failed_atomic_replace_preserves_original_file(self):
-        app.save_results(self.networks)
-        original = app.RESULTS_FILE.read_bytes()
-        with patch.object(app.os, 'replace', side_effect=OSError('write failure')):
+        storage.save_results(self.networks)
+        original = storage.RESULTS_FILE.read_bytes()
+        with patch.object(os, 'replace', side_effect=OSError('write failure')):
             with self.assertRaises(OSError):
-                app.save_results([])
-        self.assertEqual(app.RESULTS_FILE.read_bytes(), original)
-        self.assertEqual(list(app.DATA_DIR.iterdir()), [app.RESULTS_FILE])
+                storage.save_results([])
+        self.assertEqual(storage.RESULTS_FILE.read_bytes(), original)
+        self.assertEqual(list(storage.DATA_DIR.iterdir()), [storage.RESULTS_FILE])
 
     def test_saved_results_round_trip_and_legacy_records(self):
-        app.save_results(self.networks)
-        self.assertEqual(app.load_results(), self.networks)
+        storage.save_results(self.networks)
+        self.assertEqual(storage.load_results(), self.networks)
         old = {'BSSID': '02:00:00:00:00:01', 'ESSID': None, 'Signal Level': 75}
-        app.save_results([old])
-        loaded = app.load_results()[0]
+        storage.save_results([old])
+        loaded = storage.load_results()[0]
         self.assertEqual(loaded['Quality(%)'], 75)
         self.assertEqual(loaded['ESSID'], '')
         self.assertEqual(loaded['Encryption'], 'Unknown')
         self.assertNotIn('Signal Level', loaded)
-        app.display_results([loaded])
+        display.display_results([loaded])
 
     def test_invalid_saved_data_is_reported_without_crashing(self):
         for data in ('{', '{}', '[null]', '[{}]', '[{"BSSID":"02:00:00:00:00:01","Quality(%)":"high"}]',
                      '[{"BSSID":"02:00:00:00:00:01","Quality(%)":NaN}]',
                      '[{"BSSID":"02:00:00:00:00:01","Quality(%)":101}]'):
             with self.subTest(data=data):
-                app.atomic_write(app.RESULTS_FILE, data)
-                self.assertEqual(app.load_results(), [])
+                storage.atomic_write(storage.RESULTS_FILE, data)
+                self.assertEqual(storage.load_results(), [])
         self.assertIn('Cannot load saved results', self.console.getvalue())
 
     def test_network_selection_rejects_zero_negative_and_out_of_range(self):
@@ -202,21 +204,21 @@ class AirReconTests(unittest.TestCase):
             self.console.truncate(0)
             self.console.seek(0)
             with self.subTest(choice=choice), patch('builtins.input', return_value=choice):
-                app.handle_analyze({'networks': self.networks})
+                cli.handle_analyze({'networks': self.networks})
             self.assertIn('Invalid selection', self.console.getvalue())
             self.assertNotIn('\nNetwork:', self.console.getvalue())
 
     def test_filtering_combines_conditions_and_handles_unknown_signal(self):
-        self.assertEqual(app.filter_networks(self.networks, 'wpa2', 'HOME', 90), [self.networks[0]])
-        self.assertEqual(app.filter_networks(self.networks, min_quality=99), [])
+        self.assertEqual(analysis.filter_networks(self.networks, 'wpa2', 'HOME', 90), [self.networks[0]])
+        self.assertEqual(analysis.filter_networks(self.networks, min_quality=99), [])
         hidden = dict(self.networks[3], **{'Quality(%)': None})
-        self.assertEqual(app.filter_networks([hidden]), [hidden])
-        self.assertEqual(app.filter_networks([hidden], min_quality=1), [])
+        self.assertEqual(analysis.filter_networks([hidden]), [hidden])
+        self.assertEqual(analysis.filter_networks([hidden], min_quality=1), [])
 
     def test_csv_keeps_numeric_signal_and_quotes_untrusted_names(self):
         network = dict(self.networks[0], ESSID='=1+1')
         filename = self.root / 'report.csv'
-        app.save_to_csv([network], filename)
+        storage.save_to_csv([network], filename)
         with filename.open(newline='') as handle:
             row = next(csv.DictReader(handle))
         self.assertEqual(row['ESSID'], "'=1+1")
@@ -225,19 +227,19 @@ class AirReconTests(unittest.TestCase):
 
     def test_terminal_control_characters_are_escaped(self):
         network = dict(self.networks[0], ESSID='bad\x1b[2Jname')
-        app.display_results([network])
+        display.display_results([network])
         self.assertNotIn('\x1b', self.console.getvalue())
         self.assertIn('\\x1b', self.console.getvalue())
 
     def test_log_write_error_does_not_crash(self):
         with patch.object(Path, 'mkdir', side_effect=PermissionError('read only')):
-            app.log_message('test')
+            storage.log_message('test')
         self.assertIn('Could not write log', self.console.getvalue())
 
     def test_full_offline_menu_from_another_directory(self):
         # Scan, analyze, export, reload, filter, then exit in a separate process.
         commands = '2\n\n3\n1\n\n4\n\n5\n\n6\nExample\nWPA2\n80\n\n7\n'
-        result = subprocess.run([sys.executable, str(app.BASE_DIR / 'AirRecon.py'),
+        result = subprocess.run([sys.executable, str(storage.BASE_DIR / 'AirRecon.py'),
                                  '--input', str(FIXTURE.resolve()), '--output-dir', str(self.root)],
                                 input=commands, capture_output=True, text=True,
                                 cwd=self.root, timeout=10)
@@ -247,14 +249,14 @@ class AirReconTests(unittest.TestCase):
         self.assertIn('Network: Example Home', result.stdout)
         self.assertIn('Report saved to', result.stdout)
         self.assertIn('Goodbye!', result.stdout)
-        self.assertEqual(len(json.loads(app.RESULTS_FILE.read_text())), 4)
-        reports = list(app.REPORTS_DIR.glob('*.csv'))
+        self.assertEqual(len(json.loads(storage.RESULTS_FILE.read_text())), 4)
+        reports = list(storage.REPORTS_DIR.glob('*.csv'))
         self.assertEqual(len(reports), 1)
         with reports[0].open(newline='') as handle:
             self.assertEqual(len(list(csv.DictReader(handle))), 4)
 
     def test_eof_exits_without_traceback(self):
-        result = subprocess.run([sys.executable, str(app.BASE_DIR / 'AirRecon.py'),
+        result = subprocess.run([sys.executable, str(storage.BASE_DIR / 'AirRecon.py'),
                                  '--output-dir', str(self.root)], input='', capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0)
@@ -266,8 +268,8 @@ class AirReconTests(unittest.TestCase):
                               ('a\\x00', 'a\\x00'), ('\\x01', '\\x01')]:
             with self.subTest(raw=raw):
                 cell = f'BSS 02:00:00:00:00:01(on wlan0)\n\tSSID: {raw}\n'
-                self.assertEqual(app.parse_network_info(cell)['ESSID'], expected)
-        app.display_results([app.parse_network_info(
+                self.assertEqual(parser.parse_network_info(cell)['ESSID'], expected)
+        display.display_results([parser.parse_network_info(
             'BSS 02:00:00:00:00:01(on wlan0)\n\tSSID: \\x00\\x00\n')])
         self.assertIn('(hidden)', self.console.getvalue())
 
@@ -277,22 +279,22 @@ class AirReconTests(unittest.TestCase):
     def test_menu_exit_aliases(self):
         for exit_choice in ('7', '0', 'q'):
             with self.subTest(choice=exit_choice), patch('builtins.input', side_effect=[exit_choice]):
-                self.assertEqual(app.main(['--output-dir', str(self.root)]), 0)
+                self.assertEqual(cli.main(['--output-dir', str(self.root)]), 0)
 
     # --- Cached scan fallback -----------------------------------------------------
 
     def test_failed_fresh_scan_falls_back_to_cached_dump(self):
         refused = subprocess.CompletedProcess([], 255, '', 'command failed: Operation not permitted (-1)')
         cached = subprocess.CompletedProcess([], 0, self.raw, '')
-        with patch.object(app.subprocess, 'run', side_effect=[refused, cached]) as run, \
-             patch.object(app, 'request_rescan', return_value=False) as rescan:
-            self.assertEqual(app.scan_wifi('wlan0'), self.networks)
-        rescan.assert_called_once_with('wlan0', app.SCAN_TIMEOUT)
+        with patch.object(subprocess, 'run', side_effect=[refused, cached]) as run, \
+             patch.object(scanner, 'request_rescan', return_value=False) as rescan:
+            self.assertEqual(scanner.scan_wifi('wlan0'), self.networks)
+        rescan.assert_called_once_with('wlan0', scanner.SCAN_TIMEOUT)
         self.assertEqual([c.args[0] for c in run.call_args_list],
                          [['iw', 'dev', 'wlan0', 'scan'], ['iw', 'dev', 'wlan0', 'scan', 'dump']])
         self.assertIn('cached results', self.console.getvalue())
-        self.assertEqual(app.RAW_FILE.read_text(), self.raw)
-        self.assertIn('used cached scan dump (stale cache)', app.LOG_FILE.read_text())
+        self.assertEqual(storage.RAW_FILE.read_text(), self.raw)
+        self.assertIn('used cached scan dump (stale cache)', storage.LOG_FILE.read_text())
 
     def test_empty_or_failed_cache_reports_original_error(self):
         refused = subprocess.CompletedProcess([], 240, '', 'command failed: Device or resource busy (-16)')
@@ -300,71 +302,71 @@ class AirReconTests(unittest.TestCase):
                      subprocess.CompletedProcess([], 0, 'garbage', ''),
                      subprocess.CompletedProcess([], 1, '', 'nope')):
             with self.subTest(dump=dump.stdout or dump.stderr), \
-                 patch.object(app.subprocess, 'run', side_effect=[refused, dump]), \
-                 patch.object(app, 'request_rescan', return_value=True):
-                with self.assertRaisesRegex(app.ScanError, 'resource busy'):
-                    app.scan_wifi('wlan0')
-        self.assertFalse(app.RAW_FILE.exists())
+                 patch.object(subprocess, 'run', side_effect=[refused, dump]), \
+                 patch.object(scanner, 'request_rescan', return_value=True):
+                with self.assertRaisesRegex(parser.ScanError, 'resource busy'):
+                    scanner.scan_wifi('wlan0')
+        self.assertFalse(storage.RAW_FILE.exists())
 
     def test_networkmanager_rescan_is_reported(self):
         refused = subprocess.CompletedProcess([], 255, '', 'Operation not permitted (-1)')
         cached = subprocess.CompletedProcess([], 0, self.raw, '')
-        with patch.object(app.subprocess, 'run', side_effect=[refused, cached]), \
-             patch.object(app, 'request_rescan', return_value=True):
-            self.assertEqual(app.scan_wifi('wlan0'), self.networks)
+        with patch.object(subprocess, 'run', side_effect=[refused, cached]), \
+             patch.object(scanner, 'request_rescan', return_value=True):
+            self.assertEqual(scanner.scan_wifi('wlan0'), self.networks)
         self.assertIn('results from the NetworkManager rescan', self.console.getvalue())
-        self.assertIn('(NetworkManager rescan)', app.LOG_FILE.read_text())
+        self.assertIn('(NetworkManager rescan)', storage.LOG_FILE.read_text())
 
     def test_request_rescan_is_best_effort(self):
         ok = subprocess.CompletedProcess([], 0, '', '')
-        with patch.object(app.subprocess, 'run', return_value=ok) as run:
-            self.assertTrue(app.request_rescan('wlan0'))
+        with patch.object(subprocess, 'run', return_value=ok) as run:
+            self.assertTrue(scanner.request_rescan('wlan0'))
         self.assertEqual(run.call_args.args[0], ['nmcli', 'device', 'wifi', 'list',
                                                  'ifname', 'wlan0', '--rescan', 'yes'])
         for outcome in (FileNotFoundError(), subprocess.TimeoutExpired('nmcli', 25),
                         subprocess.CompletedProcess([], 10, '', 'not authorized')):
             kwargs = ({'side_effect': outcome} if isinstance(outcome, BaseException)
                       else {'return_value': outcome})
-            with self.subTest(outcome=type(outcome)), patch.object(app.subprocess, 'run', **kwargs):
-                self.assertFalse(app.request_rescan('wlan0'))
+            with self.subTest(outcome=type(outcome)), patch.object(subprocess, 'run', **kwargs):
+                self.assertFalse(scanner.request_rescan('wlan0'))
 
     # --- Adapter selection --------------------------------------------------------
 
     def test_single_adapter_is_used_automatically(self):
         state = {'interface': None}
-        with patch.object(app, 'get_wireless_interfaces', return_value=['wlo1']), \
+        with patch.object(scanner, 'get_wireless_interfaces', return_value=['wlo1']), \
              patch('builtins.input', side_effect=AssertionError('must not prompt')):
-            self.assertEqual(app.resolve_interface(state), 'wlo1')
+            self.assertEqual(cli.resolve_interface(state), 'wlo1')
         self.assertEqual(state['interface'], 'wlo1')
 
     def test_selected_adapter_is_remembered(self):
         state = {'interface': None}
-        with patch.object(app, 'get_wireless_interfaces', return_value=['wlan0', 'wlan1']):
+        with patch.object(scanner, 'get_wireless_interfaces', return_value=['wlan0', 'wlan1']):
             with patch('builtins.input', return_value='2'):
-                self.assertEqual(app.resolve_interface(state), 'wlan1')
+                self.assertEqual(cli.resolve_interface(state), 'wlan1')
             with patch('builtins.input', side_effect=AssertionError('must not prompt again')):
-                self.assertEqual(app.resolve_interface(state), 'wlan1')
+                self.assertEqual(cli.resolve_interface(state), 'wlan1')
 
     def test_unplugged_adapter_prompts_again(self):
         state = {'interface': 'wlan1'}
-        with patch.object(app, 'get_wireless_interfaces', return_value=['wlan0', 'wlan2']), \
+        with patch.object(scanner, 'get_wireless_interfaces', return_value=['wlan0', 'wlan2']), \
              patch('builtins.input', return_value='2'):
-            self.assertEqual(app.resolve_interface(state), 'wlan2')
+            self.assertEqual(cli.resolve_interface(state), 'wlan2')
         self.assertIn('wlan1 is no longer available', self.console.getvalue())
 
     def test_menu_option_1_selects_adapter_for_scanning(self):
         answers = iter(['1', '2', '', '2', '', '7'])
-        with patch.object(app, 'get_wireless_interfaces', return_value=['wlan0', 'wlan1']), \
-             patch.object(app, 'scan_wifi', return_value=self.networks) as scan, \
+        with patch.object(scanner, 'get_wireless_interfaces', return_value=['wlan0', 'wlan1']), \
+             patch.object(scanner, 'scan_wifi', return_value=self.networks) as scan, \
              patch('builtins.input', side_effect=lambda prompt='': next(answers)):
-            self.assertEqual(app.main(['--output-dir', str(self.root)]), 0)
+            self.assertEqual(cli.main(['--output-dir', str(self.root)]), 0)
         scan.assert_called_once_with('wlan1')
         self.assertIn('Adapter: wlan1', self.console.getvalue())
 
     def test_successful_fresh_scan_does_not_dump(self):
         result = subprocess.CompletedProcess([], 0, '', '')
-        with patch.object(app.subprocess, 'run', return_value=result) as run:
-            self.assertEqual(app.scan_wifi('wlan0'), [])
+        with patch.object(subprocess, 'run', return_value=result) as run:
+            self.assertEqual(scanner.scan_wifi('wlan0'), [])
         self.assertEqual(run.call_count, 1)
 
     # --- Security configuration details -------------------------------------------
@@ -376,12 +378,12 @@ class AirReconTests(unittest.TestCase):
         self.assertEqual(modern['PMF'], 'Optional')
         self.assertEqual((guest['PMF'], guest['WPS'], guest['Group Cipher']), (None, False, None))
         self.assertEqual(hidden['PMF'], 'Required')
-        self.assertEqual(app.security_warnings(hidden), [])
+        self.assertEqual(analysis.security_warnings(hidden), [])
 
     def test_ssid_cannot_spoof_wps_or_pmf(self):
         cell = ('BSS 02:00:00:00:00:01(on wlan0)\n\tSSID: WPS: MFP-required\n'
                 '\tcapability: ESS (0x0001)\n')
-        network = app.parse_network_info(cell)
+        network = parser.parse_network_info(cell)
         self.assertFalse(network['WPS'])
         self.assertIsNone(network['PMF'])
 
@@ -391,11 +393,11 @@ class AirReconTests(unittest.TestCase):
                 '\t\t * Pairwise ciphers: TKIP (default)\n\t\t * Authentication suites: PSK\n'
                 '\tRSN:\t * Version: 1\n\t\t * Group cipher: TKIP\n'
                 '\t\t * Pairwise ciphers: CCMP TKIP\n\t\t * Authentication suites: PSK\n')
-        network = app.parse_network_info(cell)
+        network = parser.parse_network_info(cell)
         self.assertEqual(network['Encryption'], 'WPA/WPA2')
         self.assertEqual(network['Group Cipher'], 'TKIP')
         self.assertEqual(network['Pairwise Ciphers'], 'CCMP TKIP')
-        text = ' '.join(app.security_warnings(network))
+        text = ' '.join(analysis.security_warnings(network))
         self.assertIn('Legacy WPA', text)
         self.assertIn('TKIP', text)
         self.assertIn('not supported', text)
@@ -404,32 +406,32 @@ class AirReconTests(unittest.TestCase):
         for label in ('WPA3', 'Enhanced Open (OWE)'):
             for pmf in ('Optional', 'Disabled'):
                 with self.subTest(label=label, pmf=pmf):
-                    warnings = app.security_warnings({'Encryption': label, 'PMF': pmf})
+                    warnings = analysis.security_warnings({'Encryption': label, 'PMF': pmf})
                     self.assertEqual(len(warnings), 1)
                     self.assertIn('requires protected management frames', warnings[0])
-        self.assertEqual(app.security_warnings({'Encryption': 'WPA2/WPA3', 'PMF': 'Optional'}), [])
+        self.assertEqual(analysis.security_warnings({'Encryption': 'WPA2/WPA3', 'PMF': 'Optional'}), [])
 
     def test_legacy_records_without_pmf_get_no_pmf_guess(self):
-        self.assertEqual(app.security_warnings({'Encryption': 'WPA3'}), [])
+        self.assertEqual(analysis.security_warnings({'Encryption': 'WPA3'}), [])
         old = {'BSSID': '02:00:00:00:00:01', 'Encryption': 'WPA3', 'Signal Level': 75}
-        app.save_results([old])
-        self.assertEqual(app.security_warnings(app.load_results()[0]), [])
+        storage.save_results([old])
+        self.assertEqual(analysis.security_warnings(storage.load_results()[0]), [])
 
     def test_invalid_security_fields_in_saved_data_are_rejected(self):
         for data in ('[{"BSSID":"02:00:00:00:00:01","WPS":"yes"}]',
                      '[{"BSSID":"02:00:00:00:00:01","PMF":1}]'):
             with self.subTest(data=data):
-                app.atomic_write(app.RESULTS_FILE, data)
-                self.assertEqual(app.load_results(), [])
+                storage.atomic_write(storage.RESULTS_FILE, data)
+                self.assertEqual(storage.load_results(), [])
 
     def test_analyze_and_csv_show_warnings(self):
         with patch('builtins.input', return_value='1'):
-            app.handle_analyze({'networks': self.networks})
+            cli.handle_analyze({'networks': self.networks})
         output = self.console.getvalue()
         self.assertIn('WPS: Advertised', output)
         self.assertIn('[!] WPS is advertised', output)
         filename = self.root / 'report.csv'
-        app.save_to_csv(self.networks, filename)
+        storage.save_to_csv(self.networks, filename)
         with filename.open(newline='') as handle:
             rows = list(csv.DictReader(handle))
         rows = {row['BSSID']: row for row in rows}
@@ -443,40 +445,40 @@ class AirReconTests(unittest.TestCase):
 
     def test_sudo_runs_return_created_files_to_invoking_user(self):
         root_owned = self.root / 'fresh'
-        app.configure_storage(root_owned)
+        storage.configure_storage(root_owned)
         env = {'SUDO_UID': '1000', 'SUDO_GID': '1001'}
-        with patch.object(app.os, 'geteuid', return_value=0), \
-             patch.dict(app.os.environ, env), patch.object(app.os, 'chown') as chown:
-            app.save_results(self.networks)
-            app.log_message('test')
-            app.save_to_csv(self.networks, app.REPORTS_DIR / 'r.csv')
+        with patch.object(os, 'geteuid', return_value=0), \
+             patch.dict(os.environ, env), patch.object(os, 'chown') as chown:
+            storage.save_results(self.networks)
+            storage.log_message('test')
+            storage.save_to_csv(self.networks, storage.REPORTS_DIR / 'r.csv')
         chowned = {Path(call.args[0]) for call in chown.call_args_list}
-        self.assertTrue({root_owned, app.DATA_DIR, app.LOGS_DIR, app.REPORTS_DIR,
-                         app.LOG_FILE, app.REPORTS_DIR / 'r.csv'} <= chowned)
+        self.assertTrue({root_owned, storage.DATA_DIR, storage.LOGS_DIR, storage.REPORTS_DIR,
+                         storage.LOG_FILE, storage.REPORTS_DIR / 'r.csv'} <= chowned)
         self.assertTrue(all(call.args[1:] == (1000, 1001) for call in chown.call_args_list))
         # The results file is chowned as its temporary name, before the atomic rename.
-        self.assertTrue(any(p.parent == app.DATA_DIR and p != app.RESULTS_FILE for p in chowned))
+        self.assertTrue(any(p.parent == storage.DATA_DIR and p != storage.RESULTS_FILE for p in chowned))
         self.assertNotIn(self.root, chowned)  # pre-existing directories are left alone
 
     def test_no_chown_without_sudo(self):
         for euid, env in ((1000, {'SUDO_UID': '1000', 'SUDO_GID': '1000'}), (0, {})):
-            with self.subTest(euid=euid), patch.object(app.os, 'geteuid', return_value=euid), \
-                 patch.dict(app.os.environ, env, clear=True), \
-                 patch.object(app.os, 'chown') as chown:
-                app.save_results(self.networks)
+            with self.subTest(euid=euid), patch.object(os, 'geteuid', return_value=euid), \
+                 patch.dict(os.environ, env, clear=True), \
+                 patch.object(os, 'chown') as chown:
+                storage.save_results(self.networks)
                 chown.assert_not_called()
 
     def test_chown_failure_does_not_break_saving(self):
-        with patch.object(app.os, 'geteuid', return_value=0), \
-             patch.dict(app.os.environ, {'SUDO_UID': '1000', 'SUDO_GID': '1000'}), \
-             patch.object(app.os, 'chown', side_effect=PermissionError('nope')):
-            app.save_results(self.networks)
-        self.assertEqual(app.load_results(), self.networks)
+        with patch.object(os, 'geteuid', return_value=0), \
+             patch.dict(os.environ, {'SUDO_UID': '1000', 'SUDO_GID': '1000'}), \
+             patch.object(os, 'chown', side_effect=PermissionError('nope')):
+            storage.save_results(self.networks)
+        self.assertEqual(storage.load_results(), self.networks)
 
     # --- Non-interactive mode -----------------------------------------------------
 
     def run_cli(self, *args):
-        return subprocess.run([sys.executable, str(app.BASE_DIR / 'AirRecon.py'),
+        return subprocess.run([sys.executable, str(storage.BASE_DIR / 'AirRecon.py'),
                                '--output-dir', str(self.root), *args],
                               input='', capture_output=True, text=True, cwd=self.root, timeout=10)
 
@@ -485,12 +487,12 @@ class AirReconTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         records = json.loads(result.stdout)
         self.assertEqual([r['BSSID'] for r in records],  # strongest signal first
-                         [n['BSSID'] for n in app.sort_networks(self.networks)])
+                         [n['BSSID'] for n in analysis.sort_networks(self.networks)])
         self.assertIn('WPS is advertised', ' '.join(records[0]['Warnings']))
         self.assertIn('Found 4 networks', result.stderr)
         self.assertNotIn('Select an option', result.stdout + result.stderr)
-        self.assertEqual(len(json.loads(app.RESULTS_FILE.read_text())), 4)
-        self.assertNotIn('Warnings', json.loads(app.RESULTS_FILE.read_text())[0])
+        self.assertEqual(len(json.loads(storage.RESULTS_FILE.read_text())), 4)
+        self.assertNotIn('Warnings', json.loads(storage.RESULTS_FILE.read_text())[0])
 
     def test_batch_csv_and_table(self):
         report = self.root / 'out' / 'scan.csv'
@@ -510,11 +512,11 @@ class AirReconTests(unittest.TestCase):
         self.assertEqual(self.run_cli('--input', str(FIXTURE), '--interface', 'wlan0').returncode, 2)
 
     def test_batch_live_scan_uses_interface(self):
-        args = app.argparse.Namespace(input=None, interface='wlan0', json=True, csv=None)
+        args = argparse.Namespace(input=None, interface='wlan0', json=True, csv=None)
         errors = io.StringIO()
-        with patch.object(app, 'scan_wifi', return_value=self.networks) as scan, \
-             patch.object(app.sys, 'stderr', errors):
-            self.assertEqual(app.run_batch(args), 0)
+        with patch.object(scanner, 'scan_wifi', return_value=self.networks) as scan, \
+             patch.object(sys, 'stderr', errors):
+            self.assertEqual(cli.run_batch(args), 0)
         scan.assert_called_once_with('wlan0')
         self.assertIn('Found 4 networks', errors.getvalue())
         self.assertEqual(len(json.loads(self.console.getvalue())), 4)
@@ -526,35 +528,35 @@ class AirReconTests(unittest.TestCase):
         nets = [{'BSSID': 'a', 'Signal (dBm)': -80.0}, {'BSSID': 'b', 'Signal (dBm)': None},
                 {'BSSID': 'c', 'Signal (dBm)': -40.0}, {'BSSID': 'd', 'Quality(%)': 70},
                 {'BSSID': 'e', 'Signal (dBm)': -40.0}]
-        self.assertEqual([n['BSSID'] for n in app.sort_networks(nets)], ['c', 'e', 'd', 'a', 'b'])
+        self.assertEqual([n['BSSID'] for n in analysis.sort_networks(nets)], ['c', 'e', 'd', 'a', 'b'])
         self.assertEqual([n['BSSID'] for n in nets], ['a', 'b', 'c', 'd', 'e'])  # input untouched
 
     def test_table_and_analysis_numbers_follow_sorted_order(self):
         weak_first = [dict(self.networks[0], **{'Signal (dBm)': -90.0}),
                       dict(self.networks[1], **{'Signal (dBm)': -30.0})]
-        app.display_results(weak_first)
+        display.display_results(weak_first)
         rows = [l for l in self.console.getvalue().splitlines() if l[:1].isdigit()]
         self.assertIn('Example Modern', rows[0])
         with patch('builtins.input', return_value='1'):
-            app.handle_analyze({'networks': weak_first})
+            cli.handle_analyze({'networks': weak_first})
         self.assertIn('Network: Example Modern', self.console.getvalue())
 
     # --- Network-name groups ------------------------------------------------------
 
     def twins(self):
-        return app.parse_scan_output(TWIN_FIXTURE.read_text(encoding='utf-8'))
+        return parser.parse_scan_output(TWIN_FIXTURE.read_text(encoding='utf-8'))
 
     def test_decode_and_name_key(self):
-        self.assertEqual(app.decode_iw_name(r'Cafe\x20'), 'Cafe ')
-        self.assertEqual(app.decode_iw_name(r'Caf\xc3\xa9'), 'Café')
-        self.assertEqual(app.decode_iw_name(r'\x5cx41'), r'\x41')
+        self.assertEqual(analysis.decode_iw_name(r'Cafe\x20'), 'Cafe ')
+        self.assertEqual(analysis.decode_iw_name(r'Caf\xc3\xa9'), 'Café')
+        self.assertEqual(analysis.decode_iw_name(r'\x5cx41'), r'\x41')
         for lookalike in (r'Home\x20', 'HOME', r'Home\xe2\x80\x8b', r'\x20home'):
             with self.subTest(name=lookalike):
-                self.assertEqual(app.name_key(lookalike), app.name_key('Home'))
-        self.assertNotEqual(app.name_key('Home-5G'), app.name_key('Home'))
+                self.assertEqual(analysis.name_key(lookalike), analysis.name_key('Home'))
+        self.assertNotEqual(analysis.name_key('Home-5G'), analysis.name_key('Home'))
 
     def test_same_name_same_security_is_information_only(self):
-        findings = app.name_findings([n for n in self.twins() if n['ESSID'] == 'Town Library'])
+        findings = analysis.name_findings([n for n in self.twins() if n['ESSID'] == 'Town Library'])
         self.assertEqual(findings['warnings'], {})
         [entry] = findings['entries']
         self.assertEqual(entry['level'], 'info')
@@ -562,7 +564,7 @@ class AirReconTests(unittest.TestCase):
 
     def test_open_twin_and_lookalike_name_are_flagged(self):
         nets = self.twins()
-        findings = app.name_findings(nets)
+        findings = analysis.name_findings(nets)
         cafe = [n for n in nets if n['ESSID'].startswith('Cafe')]
         self.assertEqual(len(cafe), 4)
         for net in cafe:
@@ -575,46 +577,46 @@ class AirReconTests(unittest.TestCase):
     def test_mixed_security_without_open(self):
         nets = [{'BSSID': 'a', 'ESSID': 'Office', 'Encryption': 'WPA2'},
                 {'BSSID': 'b', 'ESSID': 'Office', 'Encryption': 'WPA3'}]
-        warnings = app.name_findings(nets)['warnings']['a']
+        warnings = analysis.name_findings(nets)['warnings']['a']
         self.assertEqual(len(warnings), 1)
         self.assertIn('different security (WPA2, WPA3)', warnings[0])
 
     def test_hidden_and_unique_names_are_not_grouped(self):
-        findings = app.name_findings(self.networks)  # sample: unique names + one hidden
+        findings = analysis.name_findings(self.networks)  # sample: unique names + one hidden
         self.assertEqual(findings, {'warnings': {}, 'entries': [], 'groups': {}})
-        app.display_findings(self.networks)
+        display.display_findings(self.networks)
         self.assertEqual(self.console.getvalue(), '')
 
     def test_group_warnings_reach_table_csv_json_and_analysis(self):
         nets = self.twins()
-        app.display_results(nets)
-        app.display_findings(nets)
+        display.display_results(nets)
+        display.display_findings(nets)
         output = self.console.getvalue()
         self.assertIn('[2 warnings]', output)  # lookalike + open twin
         self.assertIn('common evil-twin setup', output)
         self.assertIn("'Town Library': 2 access points", output)
         report = self.root / 'twins.csv'
-        app.save_to_csv(nets, report)
+        storage.save_to_csv(nets, report)
         with report.open(newline='') as handle:
             first = next(csv.DictReader(handle))
         self.assertEqual(first['BSSID'], '02:00:00:00:0e:01')  # strongest (-41 dBm) first
         self.assertIn('evil-twin', first['Warnings'])
-        records = app.export_records(nets)
+        records = storage.export_records(nets)
         self.assertIn('evil-twin', ' '.join(records[0]['Warnings']))
         self.console.truncate(0)
         self.console.seek(0)
         with patch('builtins.input', return_value='1'):
-            app.handle_analyze({'networks': nets})
+            cli.handle_analyze({'networks': nets})
         self.assertIn('Same name also broadcast by 3 other access points', self.console.getvalue())
 
     def test_filtered_view_still_compares_against_full_scan(self):
         nets = self.twins()
-        open_only = app.filter_networks(nets, security='Open')
-        app.display_results(open_only, context=nets)
+        open_only = analysis.filter_networks(nets, security='Open')
+        display.display_results(open_only, context=nets)
         self.assertIn('[3 warnings]', self.console.getvalue())  # no encryption + 2 name warnings
 
     def test_twin_fixture_through_cli(self):
-        result = subprocess.run([sys.executable, str(app.BASE_DIR / 'AirRecon.py'),
+        result = subprocess.run([sys.executable, str(storage.BASE_DIR / 'AirRecon.py'),
                                  '--input', str(TWIN_FIXTURE), '--output-dir', str(self.root)],
                                 input='2\n\n7\n', capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -628,7 +630,7 @@ class RealScanTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.raw = REAL_FIXTURE.read_text(encoding='utf-8')
-        cls.networks = app.parse_scan_output(cls.raw)
+        cls.networks = parser.parse_scan_output(cls.raw)
 
     def test_every_bss_is_parsed_with_core_fields(self):
         self.assertEqual(len(self.networks), self.raw.count('\nBSS ') + self.raw.startswith('BSS '))
@@ -661,22 +663,22 @@ class RealScanTests(unittest.TestCase):
                              for n in self.networks))
 
     def test_bands_and_channel_counts(self):
-        self.assertEqual(sorted(Counter(app.band(n) for n in self.networks).items()),
+        self.assertEqual(sorted(Counter(analysis.band(n) for n in self.networks).items()),
                          [('2.4 GHz', 10), ('5 GHz', 6)])
-        self.assertEqual(app.analyze_channels(self.networks),
+        self.assertEqual(analysis.analyze_channels(self.networks),
                          {'2.412 GHz': 4, '2.437 GHz': 1, '2.462 GHz': 5, '5.200 GHz': 1,
                           '5.220 GHz': 1, '5.500 GHz': 2, '5.765 GHz': 2})
 
     def test_real_shared_names_are_not_false_alarms(self):
-        findings = app.name_findings(self.networks)
+        findings = analysis.name_findings(self.networks)
         self.assertEqual(findings['warnings'], {})
         self.assertEqual([(e['level'], len(e['members'])) for e in findings['entries']],
                          [('info', 2), ('info', 2), ('info', 3)])
 
     def test_real_warning_totals(self):
-        findings = app.name_findings(self.networks)
+        findings = analysis.name_findings(self.networks)
         warnings = Counter(w.split('.')[0] for n in self.networks
-                           for w in app.network_warnings(n, findings))
+                           for w in analysis.network_warnings(n, findings))
         self.assertEqual(warnings, Counter({
             'No WiFi link encryption is advertised': 2,
             'Protected management frames (PMF/802': 9,

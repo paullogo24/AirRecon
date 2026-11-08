@@ -238,6 +238,20 @@ No virtual environment is needed, since AirRecon uses only the Python standard l
 - **Cannot load saved results:** the file is unreadable or malformed. The app reports the
   problem and leaves the file untouched; a later successful scan can replace it.
 
+## Project layout
+
+```text
+AirRecon.py            Launcher: `python3 AirRecon.py` (or `python3 -m airrecon`)
+airrecon/parser.py     Turns iw scan output into network records
+airrecon/analysis.py   Security warnings, sorting, shared-name checks, filtering
+airrecon/display.py    Console tables and summaries
+airrecon/storage.py    Output paths, sudo file ownership, saved results, CSV, log
+airrecon/scanner.py    Runs iw (and nmcli for rescans without sudo)
+airrecon/cli.py        Menu and command-line options
+airrecon/util.py       Shared text helpers
+tests/                 Unit tests and scan fixtures
+```
+
 ## Tests
 
 ```bash
