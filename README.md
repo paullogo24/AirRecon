@@ -10,8 +10,9 @@ Use it on your own networks or in environments where you have permission to asse
 
 - Python 3.9 or newer; no third-party Python packages or virtual environment needed.
 - For live scans: Linux, a WiFi adapter with a working driver, and `iw`.
-- A fresh live scan usually requires root privileges. Without sudo, AirRecon falls back
-  to the system's cached results (see **How it works**). Offline mode needs neither `iw`
+- A direct live scan usually requires root privileges. Without sudo, AirRecon falls back
+  to a NetworkManager rescan if available, otherwise to cached results (see
+  **How it works**). Offline mode needs neither `iw`
   nor sudo.
 
 Install `iw` if necessary:
@@ -48,9 +49,9 @@ them. You do not need to change your normal WiFi manager or edit AirRecon's code
    `wlp2s0` are examples; you do not need to match the author's adapter name.
 
 **Alternative scanners:** live scanning currently supports only Linux with `iw`.
-There is no backend setting or automatic fallback to `nmcli`, `iwlist`, Windows,
-or macOS scanning tools. Supporting those tools would require additional scanner
-implementations. If you cannot install or use `iw`, try the offline sample below.
+`nmcli` is used only to trigger a rescan when running without sudo; results are always
+read through `iw`. There is no support for `iwlist`, Windows, or macOS scanning tools.
+Supporting those would require additional scanner implementations. If you cannot install or use `iw`, try the offline sample below.
 The `--input` option accepts plain-text **iw scan output only**, not output from
 other scanners.
 
@@ -66,8 +67,11 @@ sudo python3 AirRecon.py
 
 The filename `AirRecon.py` is case-sensitive.
 
-1. Choose **1** to list wireless adapters. Ethernet and loopback devices are excluded.
-2. Choose **2**, then enter the number of the adapter to scan (for example, `wlo1`).
+1. Choose **2** to scan. With one WiFi adapter it is used automatically; with several,
+   you are asked once and the choice is remembered (shown as `Adapter:` in the menu).
+   Choose **1** to pick a different adapter. Ethernet and loopback devices are excluded.
+2. If you run without sudo, see the fallback in **How it works**: results come from a
+   NetworkManager rescan instead of a direct scan.
 3. Read the table of network names, BSSIDs, channels, frequencies, signal levels,
    estimated quality, and security labels.
    Networks with configuration warnings are marked, e.g. `[2 warnings]`.
@@ -115,11 +119,14 @@ from replacing your real saved scan. You can also pass a previously captured pla
 1. Live mode discovers wireless adapters through `/sys/class/net` and runs
    `iw dev INTERFACE scan`, with a 25-second timeout. It does not change adapter mode,
    connect to a network, or change router settings. The driver may send probe requests.
-   If the fresh scan is refused (no sudo, or another program is scanning), AirRecon reads
-   the kernel's cached results with `iw dev INTERFACE scan dump`, which usually works
-   without root. The cache holds whatever the system last saw, so it can be stale or
-   contain only a few networks, often just the one you are connected to. If the cache is
-   empty, the original error is reported and saved results are kept.
+   If the fresh scan is refused (no sudo, or another program is scanning), AirRecon asks
+   NetworkManager to rescan (`nmcli device wifi list ifname INTERFACE --rescan yes`,
+   normally allowed for a logged-in user, about 10 seconds) and then reads the kernel's
+   results with `iw dev INTERFACE scan dump`, which works without root. Both steps are
+   best effort: without NetworkManager, the dump holds whatever the system last saw and
+   may list only a few networks, often just the one you are connected to. If it is empty,
+   the original error is reported and saved results are kept. The log records which
+   path was used.
 2. Each `BSS` block becomes a network record, including hidden SSIDs. Names broadcast
    as all zero bytes (`\x00\x00…`) are treated as hidden. The parser reads
    frequencies, dBm signal values, and RSN/WPA security fields. Network names cannot
@@ -190,8 +197,8 @@ longer use them for other work.
 ## Troubleshooting
 
 - **`iw` not found:** install it with the command above.
-- **Operation not permitted:** run live mode with sudo from your terminal. Without sudo you
-  get the cached fallback, which may list only a few networks.
+- **Operation not permitted:** without sudo AirRecon uses the NetworkManager fallback. If
+  that shows few networks (NetworkManager not running or not permitted), run with sudo.
 - **No wireless interfaces:** confirm the adapter and driver are available. Containers
   and virtual machines may not expose the host WiFi device.
 - **Failed to connect to generic netlink:** the environment may restrict kernel network
