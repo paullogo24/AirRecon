@@ -19,6 +19,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 def configure_storage(directory):
     """Resolve storage paths without creating files during import."""
     global DATA_DIR, LOGS_DIR, REPORTS_DIR, LOG_FILE, RESULTS_FILE, RAW_FILE
+    global HOSTS_FILE, HOSTS_RAW_FILE
     directory = Path(directory).expanduser().resolve()
     DATA_DIR = directory / 'data'
     LOGS_DIR = directory / 'logs'
@@ -26,6 +27,8 @@ def configure_storage(directory):
     LOG_FILE = LOGS_DIR / 'wifi_scan.log'
     RESULTS_FILE = DATA_DIR / 'wifi_scan_results.json'
     RAW_FILE = DATA_DIR / 'scan_output.txt'
+    HOSTS_FILE = DATA_DIR / 'hosts_results.json'
+    HOSTS_RAW_FILE = DATA_DIR / 'hosts_scan.xml'
 
 
 configure_storage(BASE_DIR)
@@ -86,29 +89,11 @@ def atomic_write(path, content):
 def save_to_csv(networks, filename='wifi_results.csv'):
     fields = ['ESSID', 'BSSID', 'Channel', 'Frequency', 'Signal (dBm)', 'Quality(%)', 'Encryption',
               'PMF', 'WPS', 'Group Cipher', 'Pairwise Ciphers', 'Warnings']
-    path = Path(filename)
-    make_dirs(path.parent)
     findings = analysis.name_findings(networks)
-    with path.open('w', newline='', encoding='utf-8') as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        for net in analysis.sort_networks(networks):
-            row = {}
-            for field in fields:
-                if field == 'Warnings':
-                    value = '; '.join(analysis.network_warnings(net, findings))
-                elif field == 'WPS':
-                    value = {True: 'Yes', False: 'No'}.get(net.get('WPS'), '')
-                else:
-                    value = net.get(field)
-                if isinstance(value, str):
-                    value = util.safe_text(value)
-                    # Names are untrusted spreadsheet data, not formulas.
-                    if value.lstrip().startswith(('=', '+', '-', '@')):
-                        value = "'" + value
-                row[field] = value
-            writer.writerow(row)
-    give_to_user(path)
+    rows = [dict(net, Warnings='; '.join(analysis.network_warnings(net, findings)),
+                 WPS={True: 'Yes', False: 'No'}.get(net.get('WPS'), ''))
+            for net in analysis.sort_networks(networks)]
+    write_csv(rows, fields, filename)
 
 
 def log_message(message):
@@ -163,4 +148,41 @@ def load_results():
 
 def export_records(networks):
     findings = analysis.name_findings(networks)
-    return [dict(net, Warnings=analysis.network_warnings(net, findings)) for net in analysis.sort_networks(networks)]
+    return [dict(net, Warnings=analysis.network_warnings(net, findings))
+            for net in analysis.sort_networks(networks)]
+
+
+HOST_FIELDS = ['IP', 'MAC', 'Vendor', 'Hostname', 'Role']
+
+
+def save_hosts(hosts, info):
+    """Latest device discovery, replacing the previous one (like the WiFi snapshot)."""
+    snapshot = {'scanned_at': datetime.now().isoformat(timespec='seconds'),
+                'interface': info.get('interface'),
+                'network': str(info['network']) if info.get('network') else None,
+                'hosts': hosts}
+    atomic_write(HOSTS_FILE, json.dumps(snapshot, indent=2) + '\n')
+
+
+def write_csv(rows, fields, filename):
+    """CSV with untrusted text neutralised: control characters escaped, formulas quoted."""
+    path = Path(filename)
+    make_dirs(path.parent)
+    with path.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for source in rows:
+            row = {}
+            for field in fields:
+                value = source.get(field)
+                if isinstance(value, str):
+                    value = util.safe_text(value)
+                    if value.lstrip().startswith(('=', '+', '-', '@')):
+                        value = "'" + value
+                row[field] = value
+            writer.writerow(row)
+    give_to_user(path)
+
+
+def save_hosts_csv(hosts, filename):
+    write_csv(hosts, HOST_FIELDS, filename)

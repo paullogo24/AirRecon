@@ -7,11 +7,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import analysis, display, parser, scanner, storage, util
+from . import analysis, display, hosts, parser, scanner, storage, util
 
 
 TOOL_NAME = 'AirRecon'
-TOOL_VERSION = '1.2'
+TOOL_VERSION = '1.3'
 
 
 def choose_interface(interfaces=None):
@@ -97,6 +97,86 @@ def run_batch(args):
         display.display_results(networks)
         display.display_findings(networks)
     return 0
+
+
+def finish_host_scan(found, info, csv_path=None):
+    """Save and log a successful device discovery. Returns False if the CSV failed."""
+    try:
+        storage.save_hosts(found, info)
+    except OSError as exc:
+        print(f'[!] Could not save device results: {exc}')
+    where = info.get('network') or 'saved nmap file'
+    storage.log_message(f'Device discovery on {where}; {len(found)} devices up.')
+    print(f'[+] Found {len(found)} devices.')
+    if csv_path:
+        try:
+            storage.save_hosts_csv(found, csv_path)
+        except OSError as exc:
+            print(f'[!] Could not write CSV report: {exc}')
+            return False
+        storage.log_message(f'Saved device CSV report to {csv_path}')
+        print(f'[+] Report saved to {csv_path}')
+    return True
+
+
+def acquire_hosts(hosts_input, interface):
+    if hosts_input is not None:
+        print(f'[*] Loaded offline nmap results: {hosts_input}')
+        return hosts.load_hosts_file(hosts_input)
+    return hosts.discover_hosts(interface)
+
+
+def run_hosts_batch(args):
+    """Non-interactive device discovery (--hosts): same stdout/stderr rules as WiFi scans."""
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            found, info = acquire_hosts(args.hosts_input, args.interface)
+        except (parser.ScanError, OSError, UnicodeError) as exc:
+            print(f'[!] Device discovery failed: {exc}\nPrevious results were preserved.')
+            storage.log_message(f'Device discovery failed: {exc}')
+            return 1
+        if not finish_host_scan(found, info, args.csv):
+            return 1
+    if args.json:
+        print(json.dumps({'network': str(info['network']) if info.get('network') else None,
+                          'interface': info.get('interface'), 'gateway': info.get('gateway'),
+                          'hosts': found}, indent=2))
+    else:
+        display.display_hosts(found, info)
+    return 0
+
+
+def handle_hosts(state):
+    """Menu option 7: find devices on the network the adapter is connected to."""
+    if state.get('hosts_input') is None:
+        if state.get('input_file') is not None:
+            print('[!] Offline mode: pass --hosts-input FILE (saved `nmap -sn -oX` output) '
+                  'to load device results.')
+            return
+        interface = resolve_interface(state)
+        if interface is None:
+            return
+        try:
+            info = hosts.connected_network(interface)
+            hosts.check_scannable(info['network'])
+        except parser.ScanError as exc:
+            print(f'[!] {exc}')
+            return
+        print(f"\nThis sends ping/ARP probes to every address in {info['network']} "
+              f'({info["network"].num_addresses - 2} hosts). No ports are scanned.')
+        print('Only scan networks you own or have permission to test.')
+        if input('Continue? [y/N]: ').strip().lower() not in ('y', 'yes'):
+            print('Cancelled.')
+            return
+    try:
+        found, info = acquire_hosts(state.get('hosts_input'), state.get('interface'))
+    except (parser.ScanError, OSError, UnicodeError) as exc:
+        print(f'[!] Device discovery failed: {exc}\nPrevious results were preserved.')
+        storage.log_message(f'Device discovery failed: {exc}')
+        return
+    finish_host_scan(found, info)
+    print()
+    display.display_hosts(found, info)
 
 
 def handle_scan(state):
@@ -208,14 +288,15 @@ def show_menu(offline=False, interface=None):
     print('4. Generate Report (CSV)')
     print('5. View Saved Results')
     print('6. Filter Networks')
-    print('7. Exit')
+    print('7. Find Devices on My Network (nmap)')
+    print('8. Exit')
 
 
 def main(argv=None):
     arg_parser = argparse.ArgumentParser(description=__doc__)
     arg_parser.add_argument('--input', type=Path, help='Read saved iw scan output instead of scanning hardware.')
     arg_parser.add_argument('--output-dir', type=Path, default=storage.BASE_DIR,
-                        help='Parent of data/, logs/, and reports/ (default: script directory).')
+                            help='Parent of data/, logs/, and reports/ (default: script directory).')
     batch = arg_parser.add_argument_group(
         'non-interactive mode',
         'Any of these options runs one scan without the menu, then exits '
@@ -225,21 +306,34 @@ def main(argv=None):
     batch.add_argument('--json', action='store_true',
                        help='Print results, including warnings, as JSON on stdout.')
     batch.add_argument('--csv', type=Path, metavar='PATH', help='Write a CSV report to PATH.')
+    batch.add_argument('--hosts', action='store_true',
+                       help='Find devices on the network IFACE is connected to (nmap -sn, no '
+                            'port scan) instead of scanning WiFi. Needs --interface or '
+                            '--hosts-input.')
+    arg_parser.add_argument('--hosts-input', type=Path, metavar='FILE',
+                            help='Read saved `nmap -sn -oX` output instead of running nmap.')
     args = arg_parser.parse_args(argv)
     if args.input is not None and args.interface:
         arg_parser.error('use either --input or --interface, not both')
+    if args.hosts_input is not None and args.interface and args.hosts:
+        arg_parser.error('use either --hosts-input or --interface with --hosts, not both')
     storage.configure_storage(args.output_dir)
+    if args.hosts:
+        if args.hosts_input is None and not args.interface:
+            arg_parser.error('--hosts needs --interface IFACE or --hosts-input FILE')
+        return run_hosts_batch(args)
     if args.interface or args.json or args.csv:
         if args.input is None and not args.interface:
             arg_parser.error('--json and --csv need --interface IFACE or --input FILE')
         return run_batch(args)
-    state = {'networks': None, 'input_file': args.input, 'interface': None}
+    state = {'networks': None, 'input_file': args.input, 'interface': None,
+             'hosts_input': args.hosts_input}
     print(f'Results directory: {storage.DATA_DIR.parent}')
     try:
         while True:
             show_menu(args.input is not None, state['interface'])
             choice = input('Select an option: ').strip()
-            if choice in ('7', '0', 'q', 'Q'):
+            if choice in ('8', '0', 'q', 'Q'):
                 print('Goodbye!')
                 return 0
             try:
@@ -263,6 +357,8 @@ def main(argv=None):
                     display.display_findings(saved)
                 elif choice == '6':
                     handle_filter(state)
+                elif choice == '7':
+                    handle_hosts(state)
                 else:
                     print('[!] Invalid option.')
             except (OSError, UnicodeError) as exc:

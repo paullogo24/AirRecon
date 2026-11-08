@@ -14,13 +14,17 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from airrecon import analysis, cli, display, parser, scanner, storage
+import ipaddress
+
+from airrecon import analysis, cli, display, hosts, parser, scanner, storage
 
 
 FIXTURE = Path(__file__).parent / 'fixtures' / 'sample_scan.txt'
 TWIN_FIXTURE = Path(__file__).parent / 'fixtures' / 'twin_scan.txt'
 # A real iw 6.17 scan (16 networks), anonymised: names, MACs, WPS identity, country.
 REAL_FIXTURE = Path(__file__).parent / 'fixtures' / 'real_scan.txt'
+# Synthetic nmap 7.92 `-sn -oX` output: router, this laptop, a phone, one host down.
+NMAP_FIXTURE = Path(__file__).parent / 'fixtures' / 'nmap_hosts.xml'
 
 
 class AirReconTests(unittest.TestCase):
@@ -238,7 +242,7 @@ class AirReconTests(unittest.TestCase):
 
     def test_full_offline_menu_from_another_directory(self):
         # Scan, analyze, export, reload, filter, then exit in a separate process.
-        commands = '2\n\n3\n1\n\n4\n\n5\n\n6\nExample\nWPA2\n80\n\n7\n'
+        commands = '2\n\n3\n1\n\n4\n\n5\n\n6\nExample\nWPA2\n80\n\n8\n'
         result = subprocess.run([sys.executable, str(storage.BASE_DIR / 'AirRecon.py'),
                                  '--input', str(FIXTURE.resolve()), '--output-dir', str(self.root)],
                                 input=commands, capture_output=True, text=True,
@@ -277,7 +281,7 @@ class AirReconTests(unittest.TestCase):
         self.assertNotIn('Signal Level', self.networks[0])
 
     def test_menu_exit_aliases(self):
-        for exit_choice in ('7', '0', 'q'):
+        for exit_choice in ('8', '0', 'q'):
             with self.subTest(choice=exit_choice), patch('builtins.input', side_effect=[exit_choice]):
                 self.assertEqual(cli.main(['--output-dir', str(self.root)]), 0)
 
@@ -355,7 +359,7 @@ class AirReconTests(unittest.TestCase):
         self.assertIn('wlan1 is no longer available', self.console.getvalue())
 
     def test_menu_option_1_selects_adapter_for_scanning(self):
-        answers = iter(['1', '2', '', '2', '', '7'])
+        answers = iter(['1', '2', '', '2', '', '8'])
         with patch.object(scanner, 'get_wireless_interfaces', return_value=['wlan0', 'wlan1']), \
              patch.object(scanner, 'scan_wifi', return_value=self.networks) as scan, \
              patch('builtins.input', side_effect=lambda prompt='': next(answers)):
@@ -618,7 +622,7 @@ class AirReconTests(unittest.TestCase):
     def test_twin_fixture_through_cli(self):
         result = subprocess.run([sys.executable, str(storage.BASE_DIR / 'AirRecon.py'),
                                  '--input', str(TWIN_FIXTURE), '--output-dir', str(self.root)],
-                                input='2\n\n7\n', capture_output=True, text=True, timeout=10)
+                                input='2\n\n8\n', capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Network names shared by several access points', result.stdout)
         self.assertIn('evil-twin', result.stdout)
@@ -695,6 +699,187 @@ class RealScanTests(unittest.TestCase):
                 self.assertTrue(values <= {'Example Router', 'Example Corp', 'Model X',
                                            '0000000000', '00000000-0000-0000-0000-000000000000'})
         self.assertEqual(set(re.findall(r'Country: (\S+)', self.raw)), {'XX'})
+
+
+def ip_reply(local='192.168.50.2', prefix=24, gateway='192.168.50.1'):
+    """Fake `ip -j` replies: address first, then default route."""
+    addr = json.dumps([{'ifname': 'wlo1', 'addr_info': [
+        {'family': 'inet', 'local': local, 'prefixlen': prefix, 'scope': 'global'}]}])
+    route = json.dumps([{'dst': 'default', 'gateway': gateway}] if gateway else [])
+    return [subprocess.CompletedProcess([], 0, addr, ''), subprocess.CompletedProcess([], 0, route, '')]
+
+
+class HostDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(storage.configure_storage, storage.BASE_DIR)
+        self.root = Path(self.directory.name)
+        storage.configure_storage(self.root)
+        self.xml = NMAP_FIXTURE.read_text(encoding='utf-8')
+        self.console = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.console)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def test_parse_up_hosts_sorted_numerically(self):
+        found = hosts.parse_nmap_xml(self.xml)
+        self.assertEqual([h['IP'] for h in found], ['192.168.50.1', '192.168.50.2', '192.168.50.10'])
+        router = found[0]
+        self.assertEqual((router['MAC'], router['Vendor'], router['Hostname']),
+                         ('02:00:00:aa:00:01', 'Example Networks', 'router.lan'))
+        self.assertIsNone(found[1]['MAC'])  # nmap does not report the scanning machine's MAC
+
+    def test_invalid_or_foreign_xml_is_an_error(self):
+        for text in ('not xml', '<other/>', ''):
+            with self.subTest(text=text), self.assertRaises(parser.ScanError):
+                hosts.parse_nmap_xml(text)
+        self.assertEqual(hosts.parse_nmap_xml('<nmaprun></nmaprun>'), [])
+
+    def test_connected_network_reads_address_and_gateway(self):
+        with patch.object(subprocess, 'run', side_effect=ip_reply()) as run:
+            info = hosts.connected_network('wlo1')
+        self.assertEqual(info['network'], ipaddress.ip_network('192.168.50.0/24'))
+        self.assertEqual((info['address'], info['gateway']), ('192.168.50.2', '192.168.50.1'))
+        self.assertEqual(run.call_args_list[0].args[0], ['ip', '-j', '-4', 'addr', 'show', 'dev', 'wlo1'])
+
+    def test_not_connected_is_reported(self):
+        empty = subprocess.CompletedProcess([], 0, json.dumps([{'addr_info': []}]), '')
+        with patch.object(subprocess, 'run', side_effect=[empty, empty]):
+            with self.assertRaisesRegex(parser.ScanError, 'no IPv4 address'):
+                hosts.connected_network('wlo1')
+
+    def test_only_private_home_sized_networks_are_scannable(self):
+        for allowed in ('192.168.1.0/24', '10.0.0.0/22', '172.16.5.0/25'):
+            with self.subTest(allowed=allowed):
+                hosts.check_scannable(ipaddress.ip_network(allowed))
+        for refused, reason in (('10.20.0.0/16', 'school, workplace'), ('192.168.0.0/21', 'larger'),
+                                ('8.8.8.0/24', 'not a private'), ('127.0.0.0/24', 'not a private'),
+                                ('169.254.0.0/24', 'not a private')):
+            with self.subTest(refused=refused), self.assertRaisesRegex(parser.ScanError, reason):
+                hosts.check_scannable(ipaddress.ip_network(refused))
+
+    def test_discover_runs_ping_scan_only_and_saves_raw_xml(self):
+        nmap = subprocess.CompletedProcess([], 0, self.xml, '')
+        with patch.object(subprocess, 'run', side_effect=ip_reply() + [nmap]) as run:
+            found, info = hosts.discover_hosts('wlo1')
+        self.assertEqual(run.call_args_list[2].args[0], ['nmap', '-sn', '-oX', '-', '192.168.50.0/24'])
+        self.assertEqual(run.call_args_list[2].kwargs['timeout'], hosts.HOSTS_TIMEOUT)
+        self.assertEqual([h['Role'] for h in found], ['router', 'this device', None])
+        self.assertEqual(storage.HOSTS_RAW_FILE.read_text(), self.xml)
+
+    def test_large_network_is_refused_before_nmap_runs(self):
+        with patch.object(subprocess, 'run', side_effect=ip_reply('10.20.30.40', 16, '10.20.0.1')) as run:
+            with self.assertRaisesRegex(parser.ScanError, '65,536 addresses'):
+                hosts.discover_hosts('wlo1')
+        self.assertEqual(run.call_count, 2)  # only the two `ip` calls
+
+    def test_nmap_missing_or_failing(self):
+        with patch.object(subprocess, 'run', side_effect=ip_reply() + [FileNotFoundError()]):
+            with self.assertRaisesRegex(parser.ScanError, 'Install nmap'):
+                hosts.discover_hosts('wlo1')
+        failed = subprocess.CompletedProcess([], 1, '', 'Failed to resolve')
+        with patch.object(subprocess, 'run', side_effect=ip_reply() + [failed]):
+            with self.assertRaisesRegex(parser.ScanError, 'Failed to resolve'):
+                hosts.discover_hosts('wlo1')
+        self.assertFalse(storage.HOSTS_RAW_FILE.exists())
+
+    def test_table_escapes_untrusted_hostnames_and_explains_missing_macs(self):
+        found = hosts.label_hosts(hosts.parse_nmap_xml(self.xml), {})
+        display.display_hosts(found, {})
+        output = self.console.getvalue()
+        self.assertNotIn('‮', output)
+        self.assertIn('\\u202e', output)
+        self.assertNotIn('need sudo', output)
+        self.console.truncate(0)
+        self.console.seek(0)
+        display.display_hosts([dict(h, MAC=None) for h in found], {})
+        self.assertIn('MAC addresses and vendors need sudo', self.console.getvalue())
+
+    def test_snapshot_and_csv(self):
+        found, info = hosts.load_hosts_file(NMAP_FIXTURE)
+        storage.save_hosts(found, info)
+        snapshot = json.loads(storage.HOSTS_FILE.read_text())
+        self.assertEqual(len(snapshot['hosts']), 3)
+        report = self.root / 'devices.csv'
+        storage.save_hosts_csv(found, report)
+        with report.open(newline='') as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(rows[2]['Hostname'][:2], "'=")  # formula neutralised
+        self.assertNotIn('‮', rows[2]['Hostname'])
+
+    def run_cli(self, *args, stdin=''):
+        return subprocess.run([sys.executable, str(storage.BASE_DIR / 'AirRecon.py'),
+                               '--output-dir', str(self.root), *args],
+                              input=stdin, capture_output=True, text=True, timeout=15)
+
+    def test_batch_hosts_json_and_csv_offline(self):
+        report = self.root / 'out' / 'devices.csv'
+        result = self.run_cli('--hosts', '--hosts-input', str(NMAP_FIXTURE), '--json', '--csv', str(report))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual([h['IP'] for h in data['hosts']], ['192.168.50.1', '192.168.50.2', '192.168.50.10'])
+        self.assertIn('Found 3 devices', result.stderr)
+        self.assertTrue(report.exists())
+        self.assertIn('Device discovery', storage.LOG_FILE.read_text())
+
+    def test_batch_hosts_usage_and_failure(self):
+        self.assertEqual(self.run_cli('--hosts').returncode, 2)
+        result = self.run_cli('--hosts', '--hosts-input', str(self.root / 'missing.xml'))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Device discovery failed', result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_batch_hosts_live_path(self):
+        args = argparse.Namespace(hosts_input=None, interface='wlo1', json=False, csv=None)
+        info = {'interface': 'wlo1', 'address': '192.168.50.2', 'gateway': '192.168.50.1',
+                'network': ipaddress.ip_network('192.168.50.0/24')}
+        found = hosts.label_hosts(hosts.parse_nmap_xml(self.xml), info)
+        errors = io.StringIO()
+        with patch.object(hosts, 'discover_hosts', return_value=(found, info)) as discover, \
+             patch.object(sys, 'stderr', errors):
+            self.assertEqual(cli.run_hosts_batch(args), 0)
+        discover.assert_called_once_with('wlo1')
+        self.assertIn('Network: 192.168.50.0/24 on wlo1, router 192.168.50.1', self.console.getvalue())
+
+    def test_menu_asks_before_scanning(self):
+        state = {'interface': 'wlo1', 'input_file': None, 'hosts_input': None}
+        with patch.object(scanner, 'get_wireless_interfaces', return_value=['wlo1']), \
+             patch.object(subprocess, 'run', side_effect=ip_reply()), \
+             patch.object(hosts, 'discover_hosts') as discover, \
+             patch('builtins.input', return_value='n'):
+            cli.handle_hosts(state)
+        discover.assert_not_called()
+        self.assertIn('Only scan networks you own', self.console.getvalue())
+        self.assertIn('Cancelled', self.console.getvalue())
+        info = {'interface': 'wlo1', 'address': '192.168.50.2', 'gateway': '192.168.50.1',
+                'network': ipaddress.ip_network('192.168.50.0/24')}
+        with patch.object(scanner, 'get_wireless_interfaces', return_value=['wlo1']), \
+             patch.object(subprocess, 'run', side_effect=ip_reply()), \
+             patch.object(hosts, 'discover_hosts', return_value=([], info)) as discover, \
+             patch('builtins.input', return_value='y'):
+            cli.handle_hosts(state)
+        discover.assert_called_once_with('wlo1')
+        self.assertTrue(storage.HOSTS_FILE.exists())
+
+    def test_menu_refuses_large_network_without_prompting(self):
+        state = {'interface': 'wlo1', 'input_file': None, 'hosts_input': None}
+        with patch.object(scanner, 'get_wireless_interfaces', return_value=['wlo1']), \
+             patch.object(subprocess, 'run', side_effect=ip_reply('10.20.30.40', 16)), \
+             patch('builtins.input', side_effect=AssertionError('must not prompt')):
+            cli.handle_hosts(state)
+        self.assertIn('will not scan', self.console.getvalue())
+
+    def test_menu_offline_without_hosts_file(self):
+        cli.handle_hosts({'interface': None, 'input_file': FIXTURE, 'hosts_input': None})
+        self.assertIn('--hosts-input', self.console.getvalue())
+
+    def test_menu_offline_with_hosts_file(self):
+        result = self.run_cli('--input', str(FIXTURE), '--hosts-input', str(NMAP_FIXTURE),
+                              stdin='7\n\n8\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('7. Find Devices on My Network', result.stdout)
+        self.assertIn('192.168.50.10', result.stdout)
 
 
 if __name__ == '__main__':

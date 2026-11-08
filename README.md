@@ -4,7 +4,7 @@ AirRecon is a Linux command-line WiFi discovery tool. It reads `iw` scan output,
 shows advertised network settings, saves the latest results, and exports CSV reports.
 Use it on your own networks or in environments where you have permission to assess WiFi.
 
-**Version:** 1.2 · **Author:** paul.l
+**Version:** 1.3 · **Author:** paul.l
 
 ## Requirements
 
@@ -12,8 +12,9 @@ Use it on your own networks or in environments where you have permission to asse
 - For live scans: Linux, a WiFi adapter with a working driver, and `iw`.
 - A direct live scan usually requires root privileges. Without sudo, AirRecon falls back
   to a NetworkManager rescan if available, otherwise to cached results (see
-  **How it works**). Offline mode needs neither `iw`
-  nor sudo.
+  **How it works**). Offline mode needs neither `iw` nor sudo.
+- Optional, for device discovery: `nmap` (`sudo dnf install nmap` or
+  `sudo apt install nmap`) and `ip` (iproute2, installed on most Linux systems).
 
 Install `iw` if necessary:
 
@@ -81,7 +82,9 @@ The filename `AirRecon.py` is case-sensitive.
 5. Choose **4** to export the full scan to CSV, or **5** to view saved results.
 6. Choose **6** to filter the displayed results by name, exact security label, and
    minimum quality. Filtering does not change saved results or the full-scan report.
-7. Choose **7** (or `0` / `q`) to exit. Ctrl+C and end-of-input also exit cleanly.
+7. Choose **7** to find devices on the network you are connected to (see
+   **Find devices on your network**).
+8. Choose **8** (or `0` / `q`) to exit. Ctrl+C and end-of-input also exit cleanly.
 
 ## Run without the menu
 
@@ -99,6 +102,37 @@ python3 AirRecon.py --input tests/fixtures/sample_scan.txt --json --output-dir /
 
 JSON output includes a `Warnings` list for each network; the saved snapshot does not.
 For cron, put the command in root's crontab (`sudo crontab -e`).
+
+## Find devices on your network
+
+Option **7**, or `--hosts`, lists the devices that answer on the network your WiFi adapter
+is connected to: IP address, MAC address and vendor (with sudo), hostname, and which entry
+is your router and which is this computer. It runs `nmap -sn`, a ping/ARP sweep that
+finds devices without scanning any ports.
+
+```bash
+sudo python3 AirRecon.py --hosts --interface wlo1             # table
+sudo python3 AirRecon.py --hosts --interface wlo1 --json      # JSON on stdout
+sudo python3 AirRecon.py --hosts --interface wlo1 --csv reports/devices.csv
+python3 AirRecon.py --hosts --hosts-input tests/fixtures/nmap_hosts.xml   # offline sample
+```
+
+**Only scan networks you own or have permission to test.** Even a ping sweep probes every
+device on the network, and school, workplace, and public networks usually forbid it.
+To limit mistakes:
+
+- The target is never typed in. It is the adapter's own IPv4 subnet, read with `ip`.
+- Only private networks up to `/22` (1,024 addresses) are scanned. Home networks are
+  usually `/24`. Larger networks, which typically belong to a school, workplace, or
+  provider, are refused before nmap runs, as are public, loopback, and link-local ranges.
+- The menu shows the network and number of addresses and asks for confirmation first.
+  `--hosts` counts as that confirmation.
+
+Without sudo, nmap cannot use ARP, so MAC addresses and vendors are missing and some
+devices that ignore pings may not appear. The latest results replace
+`data/hosts_results.json`, and the raw nmap XML is saved as `data/hosts_scan.xml`.
+`--hosts-input FILE` reads saved `nmap -sn -oX` output instead of running nmap; in the
+offline menu (`--input`), option 7 uses it.
 
 ## Try it without scanning
 
@@ -204,6 +238,8 @@ data/wifi_scan_results.json   Latest successful scan (not a history)
 data/scan_output.txt          Latest available raw live scan output
 logs/wifi_scan.log            Timestamped scan and export events
 reports/wifi_report_*.csv     Timestamped CSV exports
+data/hosts_results.json       Latest device discovery (option 7 / --hosts)
+data/hosts_scan.xml           Raw nmap XML from the latest device discovery
 ```
 
 Folders are created as needed. Use `--output-dir /path/to/folder` to choose a different
@@ -237,6 +273,9 @@ No virtual environment is needed, since AirRecon uses only the Python standard l
 - **Cannot save results:** choose a writable `--output-dir` and check ownership.
 - **Cannot load saved results:** the file is unreadable or malformed. The app reports the
   problem and leaves the file untouched; a later successful scan can replace it.
+- **Device discovery refuses the network:** the subnet is larger than `/22` or not
+  private. This is deliberate; see **Find devices on your network**.
+- **Device discovery shows no MAC addresses:** run with sudo.
 
 ## Project layout
 
@@ -247,6 +286,7 @@ airrecon/analysis.py   Security warnings, sorting, shared-name checks, filtering
 airrecon/display.py    Console tables and summaries
 airrecon/storage.py    Output paths, sudo file ownership, saved results, CSV, log
 airrecon/scanner.py    Runs iw (and nmcli for rescans without sudo)
+airrecon/hosts.py      Device discovery on the connected network with nmap
 airrecon/cli.py        Menu and command-line options
 airrecon/util.py       Shared text helpers
 tests/                 Unit tests and scan fixtures
@@ -259,11 +299,11 @@ cd /path/to/AirRecon
 python3 -m unittest discover -s tests -v
 ```
 
-Tests use synthetic scan output, an anonymised real scan, temporary directories, and
-mocked `iw` calls. `tests/fixtures/real_scan.txt` is a 16-network `iw` 6.17 scan with
+Tests use synthetic scan output, an anonymised real scan, synthetic nmap XML, temporary
+directories, and mocked `iw`, `ip`, and `nmap` calls. `tests/fixtures/real_scan.txt` is a 16-network `iw` 6.17 scan with
 network names, MAC addresses, WPS device details, and the country code replaced; a test
 checks that no identifying values remain. They cover parsing, configuration warnings,
 sorting, shared-name analysis, failure recovery, storage, sudo file ownership, input
-validation, filtering, CSV export, non-interactive mode, and a complete offline menu
-session. They do not run wireless scans. Live scanning still depends on your adapter,
+validation, filtering, CSV export, non-interactive mode, device discovery and its network
+limits, and complete offline menu sessions. They do not run wireless or network scans. Live scanning still depends on your adapter,
 driver, privileges, and environment.

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Nmap 7.92 scan initiated Sun Nov  8 12:00:00 2026 as: nmap -sn -oX - 192.168.50.0/24 -->
+<nmaprun scanner="nmap" args="nmap -sn -oX - 192.168.50.0/24" start="1794139200" startstr="Sun Nov  8 12:00:00 2026" version="7.92" xmloutputversion="1.05">
+<verbose level="0"/>
+<debugging level="0"/>
+<host><status state="up" reason="arp-response" reason_ttl="0"/>
+<address addr="192.168.50.1" addrtype="ipv4"/>
+<address addr="02:00:00:AA:00:01" addrtype="mac" vendor="Example Networks"/>
+<hostnames>
+<hostname name="router.lan" type="PTR"/>
+</hostnames>
+<times srtt="2000" rttvar="5000" to="100000"/>
+</host>
+<host><status state="up" reason="arp-response" reason_ttl="0"/>
+<address addr="192.168.50.10" addrtype="ipv4"/>
+<address addr="02:00:00:AA:00:0A" addrtype="mac" vendor="Example Phones"/>
+<hostnames>
+<hostname name="=HYPERLINK(&quot;x&quot;)&#x202e;evil" type="PTR"/>
+</hostnames>
+<times srtt="9000" rttvar="5000" to="100000"/>
+</host>
+<host><status state="down" reason="no-response" reason_ttl="0"/>
+<address addr="192.168.50.3" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+</host>
+<host><status state="up" reason="localhost-response" reason_ttl="0"/>
+<address addr="192.168.50.2" addrtype="ipv4"/>
+<hostnames>
+<hostname name="laptop.lan" type="PTR"/>
+</hostnames>
+</host>
+<runstats><finished time="1794139203" timestr="Sun Nov  8 12:00:03 2026" summary="Nmap done; 256 IP addresses (3 hosts up) scanned in 3.10 seconds" elapsed="3.10" exit="success"/><hosts up="3" down="253" total="256"/>
+</runstats>
+</nmaprun>

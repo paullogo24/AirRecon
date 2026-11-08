@@ -37,3 +37,23 @@ def display_results(networks, context=None):
         flag = f'  [{count} warning{"s" if count > 1 else ""}]' if count else ''
         print(f'{i:<4} {name:<26} {values[0]:<18} {values[1]:<4} {values[2]:<11} '
               f'{values[3]:<7} {values[4]:<9} {values[5]}{flag}')
+
+
+def display_hosts(hosts, info):
+    if info.get('network'):
+        print(f"Network: {info['network']} on {info['interface']}"
+              + (f", router {info['gateway']}" if info.get('gateway') else ''))
+    if not hosts:
+        print('[!] No devices answered.')
+        return
+    print(f'{"No.":<4} {"IP address":<16} {"MAC address":<18} {"Vendor":<24} {"Hostname":<28} Note')
+    print('-' * 100)
+    for i, host in enumerate(hosts, 1):
+        vendor = util.safe_text(host.get('Vendor'))
+        name = util.safe_text(host.get('Hostname'))
+        vendor = vendor if len(vendor) <= 23 else vendor[:22] + '…'
+        name = name if len(name) <= 27 else name[:26] + '…'
+        print(f'{i:<4} {util.safe_text(host.get("IP")):<16} {util.safe_text(host.get("MAC")):<18} '
+              f'{vendor:<24} {name:<28} {util.safe_text(host.get("Role"), "")}')
+    if not any(host.get('MAC') for host in hosts):
+        print('\nMAC addresses and vendors need sudo (nmap uses ARP only as root).')
