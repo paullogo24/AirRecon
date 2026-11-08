@@ -73,8 +73,9 @@ The filename `AirRecon.py` is case-sensitive.
 2. If you run without sudo, see the fallback in **How it works**: results come from a
    NetworkManager rescan instead of a direct scan.
 3. Read the table of network names, BSSIDs, channels, frequencies, signal levels,
-   estimated quality, and security labels.
-   Networks with configuration warnings are marked, e.g. `[2 warnings]`.
+   estimated quality, and security labels, strongest signal first.
+   Networks with configuration warnings are marked, e.g. `[2 warnings]`. Below the table,
+   names broadcast by several access points are summarised (see **Shared network names**).
 4. Choose **3**, then a network number, for details and configuration warnings
    (see **Configuration warnings** below).
 5. Choose **4** to export the full scan to CSV, or **5** to view saved results.
@@ -110,6 +111,14 @@ python3 AirRecon.py --input tests/fixtures/sample_scan.txt --output-dir /tmp/air
 ```
 
 Choose **2** to load the sample, then use the other menu options as above.
+
+To see shared-name warnings, load `tests/fixtures/twin_scan.txt` instead. It contains
+a fictional cafe network imitated by an Open access point and a lookalike name, plus a
+library with two normal access points:
+
+```bash
+python3 AirRecon.py --input tests/fixtures/twin_scan.txt --output-dir /tmp/airrecon-demo --csv /tmp/airrecon-demo/twins.csv
+```
 The banner says **OFFLINE**. Keeping a separate output directory prevents sample data
 from replacing your real saved scan. You can also pass a previously captured plain-text
 `iw dev INTERFACE scan` transcript to `--input`.
@@ -138,13 +147,15 @@ from replacing your real saved scan. You can also pass a previously captured pla
    scan alone is insufficient to confirm WEP. Enterprise modes can remain ambiguous:
    generic 802.1X is labeled `WPA2/3-Enterprise`; unrecognized authentication stays unknown.
    These labels describe advertised settings, not proof that a network is secure.
-5. Configuration details are read from the same RSN/WPA/WPS sections: protected
+5. Results are shown and exported strongest signal first (unmeasured last). Analysis
+   numbers follow the table. The saved JSON snapshot keeps scan order.
+6. Configuration details are read from the same RSN/WPA/WPS sections: protected
    management frames (`PMF`: Required, Optional, or Disabled), WPS presence, and group
    and pairwise ciphers. See **Configuration warnings**.
-6. Channel analysis counts BSS entries on the same center frequency. It keeps the
+7. Channel analysis counts BSS entries on the same center frequency. It keeps the
    2.4, 5, and 6 GHz bands separate. It does not measure airtime, channel-width overlap,
    interference, or the number of physical routers.
-7. Successful scans replace the last saved JSON snapshot using an atomic file replacement.
+8. Successful scans replace the last saved JSON snapshot using an atomic file replacement.
    Failed scans preserve previous results. A successful scan finding zero networks saves
    an empty snapshot. If saving fails, the new results remain available in the session.
 
@@ -165,6 +176,24 @@ Warnings are derived only from what the access point advertises:
 WPA2/WPA3 transition networks are expected to have PMF optional and are not warned for
 it. Results saved by version 1.1 lack these fields and receive no PMF/WPS/cipher warnings
 until rescanned.
+
+## Shared network names
+
+Access points are grouped by network name. Names are compared the way a person sees them:
+`iw` escapes such as `\x20` are decoded, and case, surrounding spaces, and invisible
+(zero-width) characters are ignored. Hidden networks are not grouped.
+
+| Situation | Result |
+|---|---|
+| Several access points, same name, same security | Information only: normal for dual-band routers, mesh systems, and repeaters |
+| Same name, but one access point is Open and others are encrypted | Warning: devices may join the open one; a common evil-twin setup |
+| Same name with different encrypted security (e.g. WPA2 and WPA3) | Warning: misconfiguration or imitation |
+| Names that only look identical (`Cafe` vs `Cafe\x20` or `CAFE`) | Warning: one may imitate the other |
+
+Name warnings are added to every access point in the group: in the table count, option 3,
+CSV, and JSON. Option 3 also lists the other access points broadcasting the same name.
+In a filtered view, names are still compared against the full scan. These are hints to
+check the BSSIDs, not proof of an attack.
 
 ## Files and storage
 
@@ -217,6 +246,6 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests use synthetic scan output, temporary directories, and mocked `iw` calls. They cover
-parsing, configuration warnings, failure recovery, storage, sudo file ownership, input
+parsing, configuration warnings, sorting, shared-name analysis, failure recovery, storage, sudo file ownership, input
 validation, filtering, CSV export, non-interactive mode, and a complete offline menu session. They do not run wireless scans. Live scanning still depends on your
 adapter, driver, privileges, and environment.

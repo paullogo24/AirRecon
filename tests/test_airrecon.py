@@ -14,6 +14,7 @@ import AirRecon as app
 
 
 FIXTURE = Path(__file__).parent / 'fixtures' / 'sample_scan.txt'
+TWIN_FIXTURE = Path(__file__).parent / 'fixtures' / 'twin_scan.txt'
 
 
 class AirReconTests(unittest.TestCase):
@@ -427,10 +428,12 @@ class AirReconTests(unittest.TestCase):
         app.save_to_csv(self.networks, filename)
         with filename.open(newline='') as handle:
             rows = list(csv.DictReader(handle))
-        self.assertEqual(rows[0]['WPS'], 'Yes')
-        self.assertEqual(rows[0]['PMF'], 'Disabled')
-        self.assertIn('WPS is advertised', rows[0]['Warnings'])
-        self.assertEqual(rows[3]['Warnings'], '')
+        rows = {row['BSSID']: row for row in rows}
+        home, hidden = rows['02:00:00:00:00:01'], rows['02:00:00:00:00:04']
+        self.assertEqual(home['WPS'], 'Yes')
+        self.assertEqual(home['PMF'], 'Disabled')
+        self.assertIn('WPS is advertised', home['Warnings'])
+        self.assertEqual(hidden['Warnings'], '')
 
     # --- Ownership of files created under sudo -----------------------------------
 
@@ -477,7 +480,8 @@ class AirReconTests(unittest.TestCase):
         result = self.run_cli('--input', str(FIXTURE.resolve()), '--json')
         self.assertEqual(result.returncode, 0, result.stderr)
         records = json.loads(result.stdout)
-        self.assertEqual([r['BSSID'] for r in records], [n['BSSID'] for n in self.networks])
+        self.assertEqual([r['BSSID'] for r in records],  # strongest signal first
+                         [n['BSSID'] for n in app.sort_networks(self.networks)])
         self.assertIn('WPS is advertised', ' '.join(records[0]['Warnings']))
         self.assertIn('Found 4 networks', result.stderr)
         self.assertNotIn('Select an option', result.stdout + result.stderr)
@@ -510,6 +514,108 @@ class AirReconTests(unittest.TestCase):
         scan.assert_called_once_with('wlan0')
         self.assertIn('Found 4 networks', errors.getvalue())
         self.assertEqual(len(json.loads(self.console.getvalue())), 4)
+
+
+    # --- Sorting ------------------------------------------------------------------
+
+    def test_sort_strongest_first_unknown_last(self):
+        nets = [{'BSSID': 'a', 'Signal (dBm)': -80.0}, {'BSSID': 'b', 'Signal (dBm)': None},
+                {'BSSID': 'c', 'Signal (dBm)': -40.0}, {'BSSID': 'd', 'Quality(%)': 70},
+                {'BSSID': 'e', 'Signal (dBm)': -40.0}]
+        self.assertEqual([n['BSSID'] for n in app.sort_networks(nets)], ['c', 'e', 'd', 'a', 'b'])
+        self.assertEqual([n['BSSID'] for n in nets], ['a', 'b', 'c', 'd', 'e'])  # input untouched
+
+    def test_table_and_analysis_numbers_follow_sorted_order(self):
+        weak_first = [dict(self.networks[0], **{'Signal (dBm)': -90.0}),
+                      dict(self.networks[1], **{'Signal (dBm)': -30.0})]
+        app.display_results(weak_first)
+        rows = [l for l in self.console.getvalue().splitlines() if l[:1].isdigit()]
+        self.assertIn('Example Modern', rows[0])
+        with patch('builtins.input', return_value='1'):
+            app.handle_analyze({'networks': weak_first})
+        self.assertIn('Network: Example Modern', self.console.getvalue())
+
+    # --- Network-name groups ------------------------------------------------------
+
+    def twins(self):
+        return app.parse_scan_output(TWIN_FIXTURE.read_text(encoding='utf-8'))
+
+    def test_decode_and_name_key(self):
+        self.assertEqual(app.decode_iw_name(r'Cafe\x20'), 'Cafe ')
+        self.assertEqual(app.decode_iw_name(r'Caf\xc3\xa9'), 'Café')
+        self.assertEqual(app.decode_iw_name(r'\x5cx41'), r'\x41')
+        for lookalike in (r'Home\x20', 'HOME', r'Home\xe2\x80\x8b', r'\x20home'):
+            with self.subTest(name=lookalike):
+                self.assertEqual(app.name_key(lookalike), app.name_key('Home'))
+        self.assertNotEqual(app.name_key('Home-5G'), app.name_key('Home'))
+
+    def test_same_name_same_security_is_information_only(self):
+        findings = app.name_findings([n for n in self.twins() if n['ESSID'] == 'Town Library'])
+        self.assertEqual(findings['warnings'], {})
+        [entry] = findings['entries']
+        self.assertEqual(entry['level'], 'info')
+        self.assertIn('2 access points, same security (WPA3), 2.4 GHz + 5 GHz', entry['messages'][0])
+
+    def test_open_twin_and_lookalike_name_are_flagged(self):
+        nets = self.twins()
+        findings = app.name_findings(nets)
+        cafe = [n for n in nets if n['ESSID'].startswith('Cafe')]
+        self.assertEqual(len(cafe), 4)
+        for net in cafe:
+            text = ' '.join(findings['warnings'][net['BSSID']])
+            self.assertIn('look the same', text)
+            self.assertIn('Open access point alongside encrypted ones (WPA2)', text)
+        library = [n for n in nets if n['ESSID'] == 'Town Library']
+        self.assertTrue(all(n['BSSID'] not in findings['warnings'] for n in library))
+
+    def test_mixed_security_without_open(self):
+        nets = [{'BSSID': 'a', 'ESSID': 'Office', 'Encryption': 'WPA2'},
+                {'BSSID': 'b', 'ESSID': 'Office', 'Encryption': 'WPA3'}]
+        warnings = app.name_findings(nets)['warnings']['a']
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('different security (WPA2, WPA3)', warnings[0])
+
+    def test_hidden_and_unique_names_are_not_grouped(self):
+        findings = app.name_findings(self.networks)  # sample: unique names + one hidden
+        self.assertEqual(findings, {'warnings': {}, 'entries': [], 'groups': {}})
+        app.display_findings(self.networks)
+        self.assertEqual(self.console.getvalue(), '')
+
+    def test_group_warnings_reach_table_csv_json_and_analysis(self):
+        nets = self.twins()
+        app.display_results(nets)
+        app.display_findings(nets)
+        output = self.console.getvalue()
+        self.assertIn('[2 warnings]', output)  # lookalike + open twin
+        self.assertIn('common evil-twin setup', output)
+        self.assertIn("'Town Library': 2 access points", output)
+        report = self.root / 'twins.csv'
+        app.save_to_csv(nets, report)
+        with report.open(newline='') as handle:
+            first = next(csv.DictReader(handle))
+        self.assertEqual(first['BSSID'], '02:00:00:00:0e:01')  # strongest (-41 dBm) first
+        self.assertIn('evil-twin', first['Warnings'])
+        records = app.export_records(nets)
+        self.assertIn('evil-twin', ' '.join(records[0]['Warnings']))
+        self.console.truncate(0)
+        self.console.seek(0)
+        with patch('builtins.input', return_value='1'):
+            app.handle_analyze({'networks': nets})
+        self.assertIn('Same name also broadcast by 3 other access points', self.console.getvalue())
+
+    def test_filtered_view_still_compares_against_full_scan(self):
+        nets = self.twins()
+        open_only = app.filter_networks(nets, security='Open')
+        app.display_results(open_only, context=nets)
+        self.assertIn('[3 warnings]', self.console.getvalue())  # no encryption + 2 name warnings
+
+    def test_twin_fixture_through_cli(self):
+        result = subprocess.run([sys.executable, str(app.BASE_DIR / 'AirRecon.py'),
+                                 '--input', str(TWIN_FIXTURE), '--output-dir', str(self.root)],
+                                input='2\n\n7\n', capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Network names shared by several access points', result.stdout)
+        self.assertIn('evil-twin', result.stdout)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,55 @@
+BSS 02:00:00:00:01:01(on wlan0)
+	freq: 2437
+	signal: -62.00 dBm
+	capability: ESS Privacy (0x0011)
+	SSID: Cafe Corner
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+		 * Capabilities: 1-PTKSA-RC 1-GTKSA-RC MFP-capable (0x0080)
+BSS 02:00:00:00:01:02(on wlan0)
+	freq: 5200
+	signal: -70.00 dBm
+	capability: ESS Privacy (0x0011)
+	SSID: Cafe Corner
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+		 * Capabilities: 1-PTKSA-RC 1-GTKSA-RC MFP-capable (0x0080)
+BSS 02:00:00:00:0e:01(on wlan0)
+	freq: 2462
+	signal: -41.00 dBm
+	capability: ESS (0x0001)
+	SSID: Cafe Corner
+BSS 02:00:00:00:0e:02(on wlan0)
+	freq: 2412
+	signal: -48.00 dBm
+	capability: ESS Privacy (0x0011)
+	SSID: Cafe Corner\x20
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+		 * Capabilities: 1-PTKSA-RC 1-GTKSA-RC MFP-capable (0x0080)
+BSS 02:00:00:00:02:01(on wlan0)
+	freq: 2412
+	signal: -66.00 dBm
+	capability: ESS Privacy (0x0011)
+	SSID: Town Library
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: SAE
+		 * Capabilities: 1-PTKSA-RC 1-GTKSA-RC MFP-required MFP-capable (0x00c0)
+BSS 02:00:00:00:02:02(on wlan0)
+	freq: 5745
+	signal: -72.00 dBm
+	capability: ESS Privacy (0x0011)
+	SSID: Town Library
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: SAE
+		 * Capabilities: 1-PTKSA-RC 1-GTKSA-RC MFP-required MFP-capable (0x00c0)

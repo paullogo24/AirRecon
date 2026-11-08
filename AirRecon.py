@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from datetime import datetime
 
 
@@ -338,6 +339,108 @@ def analyze_channels(networks):
     return counts
 
 
+def sort_networks(networks):
+    """Strongest signal first; networks without a measurement go last."""
+    def key(net):
+        dbm = net.get('Signal (dBm)')
+        if dbm is None and net.get('Quality(%)') is not None:
+            dbm = net['Quality(%)'] / 2 - 100  # records saved without dBm
+        return (dbm is None, -(dbm or 0))
+    return sorted(networks, key=key)
+
+
+def decode_iw_name(name):
+    r"""Undo iw's \xNN escapes (used for comparing names, never for display)."""
+    raw, pos = bytearray(), 0
+    for match in re.finditer(r'\\x([0-9A-Fa-f]{2})', name):
+        raw += name[pos:match.start()].encode('utf-8') + bytes([int(match.group(1), 16)])
+        pos = match.end()
+    raw += name[pos:].encode('utf-8')
+    return raw.decode('utf-8', errors='replace')
+
+
+def name_key(name):
+    """Names that look identical to a person map to the same key."""
+    text = unicodedata.normalize('NFKC', decode_iw_name(name))
+    text = ''.join(char for char in text if unicodedata.category(char) != 'Cf')  # zero-width
+    return text.strip().casefold()
+
+
+def band(net):
+    try:
+        ghz = float(str(net.get('Frequency')).split()[0])
+    except ValueError:
+        return None
+    return '2.4 GHz' if ghz < 3 else '5 GHz' if ghz < 5.9 else '6 GHz'
+
+
+def name_findings(networks):
+    """Compare access points that broadcast the same (or a lookalike) name.
+
+    Several access points sharing a name and security is normal: dual-band
+    routers, mesh systems and repeaters. Different security under one name,
+    or names that only look identical, are typical of misconfiguration or of
+    an imitation ("evil twin"), so those become warnings on every member.
+    Returns {'warnings': {bssid: [text]}, 'entries': [...], 'groups': {bssid: [nets]}}.
+    """
+    groups = {}
+    for net in networks:
+        if net.get('ESSID'):
+            groups.setdefault(name_key(net['ESSID']), []).append(net)
+    findings = {'warnings': {}, 'entries': [], 'groups': {}}
+    for key in sorted(groups):
+        members = sort_networks(groups[key])
+        if len(members) < 2:
+            continue
+        for net in members:
+            findings['groups'][net['BSSID']] = members
+        names = sorted({net['ESSID'] for net in members})
+        labels = sorted({net.get('Encryption') or 'Unknown' for net in members})
+        shown = ', '.join(f"'{safe_text(name)}'" for name in names)
+        problems = []
+        if len(names) > 1:
+            problems.append(f'Names {shown} look the same but differ in spacing, case or hidden '
+                            'characters; one may be imitating the other.')
+        if 'Open' in labels and len(labels) > 1:
+            problems.append(f'{shown} has an Open access point alongside encrypted ones '
+                            f'({", ".join(l for l in labels if l != "Open")}). Devices may join the '
+                            'open one automatically; this is a common evil-twin setup.')
+        elif len(labels) > 1:
+            problems.append(f'{shown} is broadcast with different security ({", ".join(labels)}); '
+                            'this can be a misconfigured access point or an imitation.')
+        if problems:
+            for net in members:
+                findings['warnings'].setdefault(net['BSSID'], []).extend(problems)
+            findings['entries'].append({'level': 'warning', 'messages': problems,
+                                        'members': members})
+        else:
+            bands = sorted({b for b in map(band, members) if b}, key=lambda b: float(b.split()[0]))
+            findings['entries'].append({'level': 'info', 'members': members, 'messages': [
+                f"'{safe_text(names[0])}': {len(members)} access points, same security "
+                f"({labels[0]})" + (f", {' + '.join(bands)}" if bands else '') +
+                '. Normal for dual-band routers, mesh systems or repeaters.']})
+    return findings
+
+
+def network_warnings(net, findings):
+    return security_warnings(net) + findings['warnings'].get(net.get('BSSID'), [])
+
+
+def display_findings(networks):
+    entries = name_findings(networks)['entries']
+    if not entries:
+        return
+    print('\nNetwork names shared by several access points:')
+    for entry in sorted(entries, key=lambda e: e['level'] != 'warning'):
+        for message in entry['messages']:
+            print(f'  [!] {message}' if entry['level'] == 'warning' else f'  {message}')
+        if entry['level'] == 'warning':
+            for net in entry['members']:
+                print(f'      {safe_text(net.get("BSSID"))}  {safe_text(net.get("Encryption")):<18} '
+                      f'{safe_text(band(net)):<8} {safe_text(net.get("Signal (dBm)"))} dBm  '
+                      f'{safe_text(net.get("ESSID"))}')
+
+
 def filter_networks(networks, security=None, ssid=None, min_quality=0):
     return [net for net in networks
             if (not security or net.get('Encryption', '').casefold() == security.casefold())
@@ -358,14 +461,15 @@ def save_to_csv(networks, filename='wifi_results.csv'):
               'PMF', 'WPS', 'Group Cipher', 'Pairwise Ciphers', 'Warnings']
     path = Path(filename)
     make_dirs(path.parent)
+    findings = name_findings(networks)
     with path.open('w', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        for net in networks:
+        for net in sort_networks(networks):
             row = {}
             for field in fields:
                 if field == 'Warnings':
-                    value = '; '.join(security_warnings(net))
+                    value = '; '.join(network_warnings(net, findings))
                 elif field == 'WPS':
                     value = {True: 'Yes', False: 'No'}.get(net.get('WPS'), '')
                 else:
@@ -380,19 +484,22 @@ def save_to_csv(networks, filename='wifi_results.csv'):
     give_to_user(path)
 
 
-def display_results(networks):
+def display_results(networks, context=None):
+    """Print a table, strongest first. `context` is the full scan when showing a
+    filtered subset, so name comparisons still see every access point."""
     if not networks:
         print('[!] No networks found.')
         return
+    findings = name_findings(context if context is not None else networks)
     print(f'{"No.":<4} {"ESSID":<26} {"BSSID":<18} {"Ch":<4} {"Frequency":<11} {"dBm":<7} {"Quality%":<9} Security')
     print('-' * 110)
-    for i, net in enumerate(networks, 1):
+    for i, net in enumerate(sort_networks(networks), 1):
         name = safe_text(net.get('ESSID') or '(hidden)')
         if len(name) > 25:
             name = name[:24] + '…'
         values = [safe_text(net.get(key)) for key in
                   ('BSSID', 'Channel', 'Frequency', 'Signal (dBm)', 'Quality(%)', 'Encryption')]
-        count = len(security_warnings(net))
+        count = len(network_warnings(net, findings))
         flag = f'  [{count} warning{"s" if count > 1 else ""}]' if count else ''
         print(f'{i:<4} {name:<26} {values[0]:<18} {values[1]:<4} {values[2]:<11} '
               f'{values[3]:<7} {values[4]:<9} {values[5]}{flag}')
@@ -499,7 +606,8 @@ def acquire_networks(source=None, interface=None):
 
 
 def export_records(networks):
-    return [dict(net, Warnings=security_warnings(net)) for net in networks]
+    findings = name_findings(networks)
+    return [dict(net, Warnings=network_warnings(net, findings)) for net in sort_networks(networks)]
 
 
 def run_batch(args):
@@ -533,6 +641,7 @@ def run_batch(args):
         print(json.dumps(export_records(networks), indent=2, allow_nan=False))
     else:
         display_results(networks)
+        display_findings(networks)
     return 0
 
 
@@ -557,6 +666,7 @@ def handle_scan(state):
     log_message(f'Scanned {source or interface}; found {len(networks)} networks.')
     print(f'\n[+] Found {len(networks)} networks.\n')
     display_results(networks)
+    display_findings(networks)
 
 
 def handle_analyze(state):
@@ -564,6 +674,7 @@ def handle_analyze(state):
     if not networks:
         print('[!] No scan data available. Run a scan first (option 2).')
         return
+    networks = sort_networks(networks)  # numbering matches the displayed table
     display_results(networks)
     choice = input('\nEnter network number to analyze (or blank to cancel): ').strip()
     if not choice:
@@ -582,8 +693,16 @@ def handle_analyze(state):
         print(f'  {field}: {safe_text(net.get(field))}')
     if 'WPS' in net:
         print(f'  WPS: {"Advertised" if net["WPS"] else "Not advertised"}')
-    for warning in security_warnings(net):
+    findings = name_findings(networks)
+    for warning in network_warnings(net, findings):
         print(f'  [!] {warning}')
+    others = [n for n in findings['groups'].get(net['BSSID'], []) if n is not net]
+    if others:
+        print(f'  Same name also broadcast by {len(others)} other access point'
+              f'{"s" if len(others) > 1 else ""}:')
+        for other in others:
+            print(f'    {safe_text(other.get("BSSID"))}  {safe_text(other.get("Encryption"))}, '
+                  f'{safe_text(band(other))}, {safe_text(other.get("Signal (dBm)"))} dBm')
     frequency = net.get('Frequency')
     count = analyze_channels(networks).get(frequency, 0)
     if count > 1:
@@ -619,7 +738,7 @@ def handle_filter(state):
     except ValueError:
         print('[!] Quality must be a whole number from 0 to 100.')
         return
-    display_results(filter_networks(networks, security, ssid, quality))
+    display_results(filter_networks(networks, security, ssid, quality), context=networks)
     print('Filter applies to this view; reports use the full scan.')
 
 
@@ -685,7 +804,9 @@ def main(argv=None):
                 elif choice == '4':
                     handle_report(state)
                 elif choice == '5':
-                    display_results(load_results())
+                    saved = load_results()
+                    display_results(saved)
+                    display_findings(saved)
                 elif choice == '6':
                     handle_filter(state)
                 else:
