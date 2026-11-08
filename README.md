@@ -188,11 +188,11 @@ Files left root-owned by version 1.1 are replaced on the next sudo scan, or fix 
 with `sudo chown -R $USER: data logs reports`. Use a separate output directory for
 unprivileged demo runs. Reports include the full scan and include PMF, WPS, cipher, and warning columns, and protect text cells beginning
 with spreadsheet formula characters by prefixing an apostrophe. JSON retains the original
-name as represented by `iw`; `iw` escape sequences are not decoded.
+name as represented by `iw`; `iw` escape sequences are not decoded. The exception is a name
+made only of `\x00` escapes, which is stored as an empty (hidden) name.
 
 Generated data, logs, reports, Python caches, and virtual environments are ignored by Git.
-The existing `myenv/` and `venv/` directories are not needed and can be removed if you no
-longer use them for other work.
+No virtual environment is needed, since AirRecon uses only the Python standard library.
 
 ## Troubleshooting
 
