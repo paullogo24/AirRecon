@@ -132,7 +132,7 @@ class AirReconTests(unittest.TestCase):
         app.save_results(self.networks)
         previous_bytes = app.RESULTS_FILE.read_bytes()
         state = {'networks': self.networks}
-        with patch.object(app, 'choose_interface', return_value='wlan0'), patch.object(app, 'scan_wifi', side_effect=app.ScanError('failed')):
+        with patch.object(app, 'resolve_interface', return_value='wlan0'), patch.object(app, 'scan_wifi', side_effect=app.ScanError('failed')):
             app.handle_scan(state)
         self.assertIs(state['networks'], self.networks)
         self.assertEqual(app.RESULTS_FILE.read_bytes(), previous_bytes)
@@ -142,7 +142,7 @@ class AirReconTests(unittest.TestCase):
     def test_successful_empty_scan_replaces_previous_results(self):
         app.save_results(self.networks)
         state = {'networks': self.networks}
-        with patch.object(app, 'choose_interface', return_value='wlan0'), patch.object(app, 'scan_wifi', return_value=[]):
+        with patch.object(app, 'resolve_interface', return_value='wlan0'), patch.object(app, 'scan_wifi', return_value=[]):
             app.handle_scan(state)
         self.assertEqual(state['networks'], [])
         self.assertEqual(app.load_results(), [])
@@ -279,13 +279,15 @@ class AirReconTests(unittest.TestCase):
     def test_failed_fresh_scan_falls_back_to_cached_dump(self):
         refused = subprocess.CompletedProcess([], 255, '', 'command failed: Operation not permitted (-1)')
         cached = subprocess.CompletedProcess([], 0, self.raw, '')
-        with patch.object(app.subprocess, 'run', side_effect=[refused, cached]) as run:
+        with patch.object(app.subprocess, 'run', side_effect=[refused, cached]) as run, \
+             patch.object(app, 'request_rescan', return_value=False) as rescan:
             self.assertEqual(app.scan_wifi('wlan0'), self.networks)
+        rescan.assert_called_once_with('wlan0', app.SCAN_TIMEOUT)
         self.assertEqual([c.args[0] for c in run.call_args_list],
                          [['iw', 'dev', 'wlan0', 'scan'], ['iw', 'dev', 'wlan0', 'scan', 'dump']])
         self.assertIn('cached results', self.console.getvalue())
         self.assertEqual(app.RAW_FILE.read_text(), self.raw)
-        self.assertIn('used cached scan dump', app.LOG_FILE.read_text())
+        self.assertIn('used cached scan dump (stale cache)', app.LOG_FILE.read_text())
 
     def test_empty_or_failed_cache_reports_original_error(self):
         refused = subprocess.CompletedProcess([], 240, '', 'command failed: Device or resource busy (-16)')
@@ -293,10 +295,66 @@ class AirReconTests(unittest.TestCase):
                      subprocess.CompletedProcess([], 0, 'garbage', ''),
                      subprocess.CompletedProcess([], 1, '', 'nope')):
             with self.subTest(dump=dump.stdout or dump.stderr), \
-                 patch.object(app.subprocess, 'run', side_effect=[refused, dump]):
+                 patch.object(app.subprocess, 'run', side_effect=[refused, dump]), \
+                 patch.object(app, 'request_rescan', return_value=True):
                 with self.assertRaisesRegex(app.ScanError, 'resource busy'):
                     app.scan_wifi('wlan0')
         self.assertFalse(app.RAW_FILE.exists())
+
+    def test_networkmanager_rescan_is_reported(self):
+        refused = subprocess.CompletedProcess([], 255, '', 'Operation not permitted (-1)')
+        cached = subprocess.CompletedProcess([], 0, self.raw, '')
+        with patch.object(app.subprocess, 'run', side_effect=[refused, cached]), \
+             patch.object(app, 'request_rescan', return_value=True):
+            self.assertEqual(app.scan_wifi('wlan0'), self.networks)
+        self.assertIn('results from the NetworkManager rescan', self.console.getvalue())
+        self.assertIn('(NetworkManager rescan)', app.LOG_FILE.read_text())
+
+    def test_request_rescan_is_best_effort(self):
+        ok = subprocess.CompletedProcess([], 0, '', '')
+        with patch.object(app.subprocess, 'run', return_value=ok) as run:
+            self.assertTrue(app.request_rescan('wlan0'))
+        self.assertEqual(run.call_args.args[0], ['nmcli', 'device', 'wifi', 'list',
+                                                 'ifname', 'wlan0', '--rescan', 'yes'])
+        for outcome in (FileNotFoundError(), subprocess.TimeoutExpired('nmcli', 25),
+                        subprocess.CompletedProcess([], 10, '', 'not authorized')):
+            kwargs = ({'side_effect': outcome} if isinstance(outcome, BaseException)
+                      else {'return_value': outcome})
+            with self.subTest(outcome=type(outcome)), patch.object(app.subprocess, 'run', **kwargs):
+                self.assertFalse(app.request_rescan('wlan0'))
+
+    # --- Adapter selection --------------------------------------------------------
+
+    def test_single_adapter_is_used_automatically(self):
+        state = {'interface': None}
+        with patch.object(app, 'get_wireless_interfaces', return_value=['wlo1']), \
+             patch('builtins.input', side_effect=AssertionError('must not prompt')):
+            self.assertEqual(app.resolve_interface(state), 'wlo1')
+        self.assertEqual(state['interface'], 'wlo1')
+
+    def test_selected_adapter_is_remembered(self):
+        state = {'interface': None}
+        with patch.object(app, 'get_wireless_interfaces', return_value=['wlan0', 'wlan1']):
+            with patch('builtins.input', return_value='2'):
+                self.assertEqual(app.resolve_interface(state), 'wlan1')
+            with patch('builtins.input', side_effect=AssertionError('must not prompt again')):
+                self.assertEqual(app.resolve_interface(state), 'wlan1')
+
+    def test_unplugged_adapter_prompts_again(self):
+        state = {'interface': 'wlan1'}
+        with patch.object(app, 'get_wireless_interfaces', return_value=['wlan0', 'wlan2']), \
+             patch('builtins.input', return_value='2'):
+            self.assertEqual(app.resolve_interface(state), 'wlan2')
+        self.assertIn('wlan1 is no longer available', self.console.getvalue())
+
+    def test_menu_option_1_selects_adapter_for_scanning(self):
+        answers = iter(['1', '2', '', '2', '', '7'])
+        with patch.object(app, 'get_wireless_interfaces', return_value=['wlan0', 'wlan1']), \
+             patch.object(app, 'scan_wifi', return_value=self.networks) as scan, \
+             patch('builtins.input', side_effect=lambda prompt='': next(answers)):
+            self.assertEqual(app.main(['--output-dir', str(self.root)]), 0)
+        scan.assert_called_once_with('wlan1')
+        self.assertIn('Adapter: wlan1', self.console.getvalue())
 
     def test_successful_fresh_scan_does_not_dump(self):
         result = subprocess.CompletedProcess([], 0, '', '')

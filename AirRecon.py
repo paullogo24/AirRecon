@@ -272,12 +272,26 @@ def run_iw(interface, command, timeout):
         raise ScanError(f'Cannot run iw: {exc}') from exc
 
 
+def request_rescan(interface, timeout=SCAN_TIMEOUT):
+    """Ask NetworkManager to rescan and wait for it; usually allowed without sudo.
+
+    Best effort: returns False if nmcli is missing, refuses, or times out.
+    """
+    try:
+        result = subprocess.run(['nmcli', 'device', 'wifi', 'list', 'ifname', interface,
+                                 '--rescan', 'yes'], capture_output=True, text=True,
+                                errors='replace', timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def scan_wifi(interface, timeout=SCAN_TIMEOUT):
     """Trigger a fresh scan; if iw refuses, fall back to the kernel's cached results.
 
     `iw scan` needs root and fails while another program is scanning, but
-    `iw scan dump` returns what the system (e.g. NetworkManager) last found and
-    usually works without sudo. An empty cache is not treated as a success,
+    NetworkManager can usually rescan for a normal user, and `iw scan dump`
+    then returns the refreshed kernel cache without sudo. An empty cache is not treated as a success,
     so a failed scan never replaces saved results with nothing.
     """
     print(f'[*] Scanning on {interface}...')
@@ -285,6 +299,8 @@ def scan_wifi(interface, timeout=SCAN_TIMEOUT):
     networks = None
     if result.returncode:
         detail = result.stderr.strip() or f'iw exited with status {result.returncode}'
+        print(f'[*] Fresh scan unavailable ({detail}); asking NetworkManager to rescan...')
+        refreshed = request_rescan(interface, timeout)
         cached = run_iw(interface, ['scan', 'dump'], timeout)
         if not cached.returncode:
             try:
@@ -295,9 +311,14 @@ def scan_wifi(interface, timeout=SCAN_TIMEOUT):
             raise ScanError(f'{detail}. Check permissions, WiFi/rfkill, and whether '
                             'another scan is running. Live scans usually need sudo.')
         result = cached
-        print(f'[*] Fresh scan unavailable ({detail}); showing cached results from the '
-              'last system scan. These may be incomplete; run with sudo for a full scan.')
-        log_message(f'Fresh scan on {interface} failed ({detail}); used cached scan dump.')
+        if refreshed:
+            print('[*] Showing results from the NetworkManager rescan. '
+                  'Run with sudo for a direct scan.')
+        else:
+            print('[*] NetworkManager rescan unavailable; showing cached results from the '
+                  'last system scan. These may be incomplete; run with sudo for a full scan.')
+        how = 'NetworkManager rescan' if refreshed else 'stale cache'
+        log_message(f'Fresh scan on {interface} failed ({detail}); used cached scan dump ({how}).')
     else:
         networks = parse_scan_output(result.stdout)
     try:
@@ -427,8 +448,8 @@ def load_results():
         return []
 
 
-def choose_interface():
-    interfaces = get_wireless_interfaces()
+def choose_interface(interfaces=None):
+    interfaces = get_wireless_interfaces() if interfaces is None else interfaces
     if not interfaces:
         print('[!] No wireless interfaces found. A Linux WiFi adapter is required for live scans.')
         return None
@@ -443,6 +464,25 @@ def choose_interface():
         pass
     print('[!] Invalid selection.')
     return None
+
+
+def resolve_interface(state):
+    """Reuse the selected adapter, use the only one present, or ask the user."""
+    interfaces = get_wireless_interfaces()
+    remembered = state.get('interface')
+    if remembered in interfaces:
+        return remembered
+    if remembered:
+        print(f'[!] Adapter {remembered} is no longer available.')
+        state['interface'] = None
+    if len(interfaces) == 1:
+        print(f'[*] Using the only wireless adapter: {interfaces[0]}')
+        chosen = interfaces[0]
+    else:
+        chosen = choose_interface(interfaces)
+    if chosen:
+        state['interface'] = chosen
+    return chosen
 
 
 def current_results(state):
@@ -500,7 +540,7 @@ def handle_scan(state):
     source = state.get('input_file')
     interface = None
     if source is None:
-        interface = choose_interface()
+        interface = resolve_interface(state)
         if interface is None:
             return
     try:
@@ -583,11 +623,13 @@ def handle_filter(state):
     print('Filter applies to this view; reports use the full scan.')
 
 
-def show_menu(offline=False):
+def show_menu(offline=False, interface=None):
     print('\n' + '=' * 60)
     print(f'{TOOL_NAME} — Version {TOOL_VERSION}' + (' [OFFLINE]' if offline else ''))
+    if interface:
+        print(f'Adapter: {interface}')
     print('=' * 60)
-    print('1. List Wireless Interfaces')
+    print('1. ' + ('List Wireless Interfaces' if offline else 'Select Wireless Interface'))
     print('2. ' + ('Load Offline Scan' if offline else 'Scan for WiFi Networks'))
     print('3. Analyze Selected Network')
     print('4. Generate Report (CSV)')
@@ -618,19 +660,24 @@ def main(argv=None):
         if args.input is None and not args.interface:
             parser.error('--json and --csv need --interface IFACE or --input FILE')
         return run_batch(args)
-    state = {'networks': None, 'input_file': args.input}
+    state = {'networks': None, 'input_file': args.input, 'interface': None}
     print(f'Results directory: {DATA_DIR.parent}')
     try:
         while True:
-            show_menu(args.input is not None)
+            show_menu(args.input is not None, state['interface'])
             choice = input('Select an option: ').strip()
             if choice in ('7', '0', 'q', 'Q'):
                 print('Goodbye!')
                 return 0
             try:
-                if choice == '1':
+                if choice == '1' and args.input is not None:
                     interfaces = get_wireless_interfaces()
                     print('Wireless interfaces: ' + (', '.join(interfaces) or '(none found)'))
+                elif choice == '1':
+                    chosen = choose_interface()
+                    if chosen:
+                        state['interface'] = chosen
+                        print(f'[+] Option 2 will scan {chosen}.')
                 elif choice == '2':
                     handle_scan(state)
                 elif choice == '3':
