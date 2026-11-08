@@ -255,6 +255,155 @@ class AirReconTests(unittest.TestCase):
         self.assertEqual(result.stderr, '')
         self.assertIn('Goodbye!', result.stdout)
 
+    # --- Security configuration details -------------------------------------------
+
+    def test_sample_security_details(self):
+        home, modern, guest, hidden = self.networks
+        self.assertEqual((home['PMF'], home['WPS']), ('Disabled', True))
+        self.assertEqual((home['Group Cipher'], home['Pairwise Ciphers']), ('CCMP', 'CCMP'))
+        self.assertEqual(modern['PMF'], 'Optional')
+        self.assertEqual((guest['PMF'], guest['WPS'], guest['Group Cipher']), (None, False, None))
+        self.assertEqual(hidden['PMF'], 'Required')
+        self.assertEqual(app.security_warnings(hidden), [])
+
+    def test_ssid_cannot_spoof_wps_or_pmf(self):
+        cell = ('BSS 02:00:00:00:00:01(on wlan0)\n\tSSID: WPS: MFP-required\n'
+                '\tcapability: ESS (0x0001)\n')
+        network = app.parse_network_info(cell)
+        self.assertFalse(network['WPS'])
+        self.assertIsNone(network['PMF'])
+
+    def test_tkip_and_wpa_ciphers_are_flagged(self):
+        cell = ('BSS 02:00:00:00:00:01(on wlan0)\n\tcapability: ESS Privacy (0x0011)\n'
+                '\tWPA:\t * Version: 1\n\t\t * Group cipher: TKIP\n'
+                '\t\t * Pairwise ciphers: TKIP (default)\n\t\t * Authentication suites: PSK\n'
+                '\tRSN:\t * Version: 1\n\t\t * Group cipher: TKIP\n'
+                '\t\t * Pairwise ciphers: CCMP TKIP\n\t\t * Authentication suites: PSK\n')
+        network = app.parse_network_info(cell)
+        self.assertEqual(network['Encryption'], 'WPA/WPA2')
+        self.assertEqual(network['Group Cipher'], 'TKIP')
+        self.assertEqual(network['Pairwise Ciphers'], 'CCMP TKIP')
+        text = ' '.join(app.security_warnings(network))
+        self.assertIn('Legacy WPA', text)
+        self.assertIn('TKIP', text)
+        self.assertIn('not supported', text)
+
+    def test_wpa3_without_required_pmf_is_flagged(self):
+        for label in ('WPA3', 'Enhanced Open (OWE)'):
+            for pmf in ('Optional', 'Disabled'):
+                with self.subTest(label=label, pmf=pmf):
+                    warnings = app.security_warnings({'Encryption': label, 'PMF': pmf})
+                    self.assertEqual(len(warnings), 1)
+                    self.assertIn('requires protected management frames', warnings[0])
+        self.assertEqual(app.security_warnings({'Encryption': 'WPA2/WPA3', 'PMF': 'Optional'}), [])
+
+    def test_legacy_records_without_pmf_get_no_pmf_guess(self):
+        self.assertEqual(app.security_warnings({'Encryption': 'WPA3'}), [])
+        old = {'BSSID': '02:00:00:00:00:01', 'Encryption': 'WPA3', 'Signal Level': 75}
+        app.save_results([old])
+        self.assertEqual(app.security_warnings(app.load_results()[0]), [])
+
+    def test_invalid_security_fields_in_saved_data_are_rejected(self):
+        for data in ('[{"BSSID":"02:00:00:00:00:01","WPS":"yes"}]',
+                     '[{"BSSID":"02:00:00:00:00:01","PMF":1}]'):
+            with self.subTest(data=data):
+                app.atomic_write(app.RESULTS_FILE, data)
+                self.assertEqual(app.load_results(), [])
+
+    def test_analyze_and_csv_show_warnings(self):
+        with patch('builtins.input', return_value='1'):
+            app.handle_analyze({'networks': self.networks})
+        output = self.console.getvalue()
+        self.assertIn('WPS: Advertised', output)
+        self.assertIn('[!] WPS is advertised', output)
+        filename = self.root / 'report.csv'
+        app.save_to_csv(self.networks, filename)
+        with filename.open(newline='') as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(rows[0]['WPS'], 'Yes')
+        self.assertEqual(rows[0]['PMF'], 'Disabled')
+        self.assertIn('WPS is advertised', rows[0]['Warnings'])
+        self.assertEqual(rows[3]['Warnings'], '')
+
+    # --- Ownership of files created under sudo -----------------------------------
+
+    def test_sudo_runs_return_created_files_to_invoking_user(self):
+        root_owned = self.root / 'fresh'
+        app.configure_storage(root_owned)
+        env = {'SUDO_UID': '1000', 'SUDO_GID': '1001'}
+        with patch.object(app.os, 'geteuid', return_value=0), \
+             patch.dict(app.os.environ, env), patch.object(app.os, 'chown') as chown:
+            app.save_results(self.networks)
+            app.log_message('test')
+            app.save_to_csv(self.networks, app.REPORTS_DIR / 'r.csv')
+        chowned = {Path(call.args[0]) for call in chown.call_args_list}
+        self.assertTrue({root_owned, app.DATA_DIR, app.LOGS_DIR, app.REPORTS_DIR,
+                         app.LOG_FILE, app.REPORTS_DIR / 'r.csv'} <= chowned)
+        self.assertTrue(all(call.args[1:] == (1000, 1001) for call in chown.call_args_list))
+        # The results file is chowned as its temporary name, before the atomic rename.
+        self.assertTrue(any(p.parent == app.DATA_DIR and p != app.RESULTS_FILE for p in chowned))
+        self.assertNotIn(self.root, chowned)  # pre-existing directories are left alone
+
+    def test_no_chown_without_sudo(self):
+        for euid, env in ((1000, {'SUDO_UID': '1000', 'SUDO_GID': '1000'}), (0, {})):
+            with self.subTest(euid=euid), patch.object(app.os, 'geteuid', return_value=euid), \
+                 patch.dict(app.os.environ, env, clear=True), \
+                 patch.object(app.os, 'chown') as chown:
+                app.save_results(self.networks)
+                chown.assert_not_called()
+
+    def test_chown_failure_does_not_break_saving(self):
+        with patch.object(app.os, 'geteuid', return_value=0), \
+             patch.dict(app.os.environ, {'SUDO_UID': '1000', 'SUDO_GID': '1000'}), \
+             patch.object(app.os, 'chown', side_effect=PermissionError('nope')):
+            app.save_results(self.networks)
+        self.assertEqual(app.load_results(), self.networks)
+
+    # --- Non-interactive mode -----------------------------------------------------
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(app.BASE_DIR / 'AirRecon.py'),
+                               '--output-dir', str(self.root), *args],
+                              input='', capture_output=True, text=True, cwd=self.root, timeout=10)
+
+    def test_batch_json_goes_to_stdout_and_progress_to_stderr(self):
+        result = self.run_cli('--input', str(FIXTURE.resolve()), '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = json.loads(result.stdout)
+        self.assertEqual([r['BSSID'] for r in records], [n['BSSID'] for n in self.networks])
+        self.assertIn('WPS is advertised', ' '.join(records[0]['Warnings']))
+        self.assertIn('Found 4 networks', result.stderr)
+        self.assertNotIn('Select an option', result.stdout + result.stderr)
+        self.assertEqual(len(json.loads(app.RESULTS_FILE.read_text())), 4)
+        self.assertNotIn('Warnings', json.loads(app.RESULTS_FILE.read_text())[0])
+
+    def test_batch_csv_and_table(self):
+        report = self.root / 'out' / 'scan.csv'
+        result = self.run_cli('--input', str(FIXTURE.resolve()), '--csv', str(report))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Example Home', result.stdout)
+        self.assertIn('Report saved to', result.stderr)
+        with report.open(newline='') as handle:
+            self.assertEqual(len(list(csv.DictReader(handle))), 4)
+
+    def test_batch_failures_and_usage_errors(self):
+        result = self.run_cli('--input', str(self.root / 'missing'), '--json')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('Scan failed', result.stderr)
+        self.assertEqual(self.run_cli('--json').returncode, 2)
+        self.assertEqual(self.run_cli('--input', str(FIXTURE), '--interface', 'wlan0').returncode, 2)
+
+    def test_batch_live_scan_uses_interface(self):
+        args = app.argparse.Namespace(input=None, interface='wlan0', json=True, csv=None)
+        errors = io.StringIO()
+        with patch.object(app, 'scan_wifi', return_value=self.networks) as scan, \
+             patch.object(app.sys, 'stderr', errors):
+            self.assertEqual(app.run_batch(args), 0)
+        scan.assert_called_once_with('wlan0')
+        self.assertIn('Found 4 networks', errors.getvalue())
+        self.assertEqual(len(json.loads(self.console.getvalue())), 4)
+
 
 if __name__ == '__main__':
     unittest.main()

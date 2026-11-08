@@ -7,6 +7,10 @@ BSS 02:00:00:00:00:01(on wlan0)
 		 * Group cipher: CCMP
 		 * Pairwise ciphers: CCMP
 		 * Authentication suites: PSK
+		 * Capabilities: 1-PTKSA-RC 1-GTKSA-RC (0x0000)
+	WPS:	 * Version: 1.0
+		 * Wi-Fi Protected Setup State: 2 (Configured)
+		 * Response Type: 3 (AP)
 BSS 02:00:00:00:00:02(on wlan0)
 	freq: 5180
 	signal: -66.00 dBm
@@ -15,6 +19,7 @@ BSS 02:00:00:00:00:02(on wlan0)
 	RSN: * Version: 1
 		 * Group cipher: CCMP
 		 * Authentication suites: PSK SAE
+		 * Capabilities: 1-PTKSA-RC 1-GTKSA-RC MFP-capable (0x0080)
 BSS 02:00:00:00:00:03(on wlan0)
 	freq: 2412
 	signal: -78.00 dBm
@@ -29,3 +34,4 @@ BSS 02:00:00:00:00:04(on wlan0)
 	RSN: * Version: 1
 		 * Group cipher: CCMP
 		 * Authentication suites: SAE
+		 * Capabilities: 1-PTKSA-RC 1-GTKSA-RC MFP-required MFP-capable (0x00c0)

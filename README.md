@@ -4,7 +4,7 @@ AirRecon is a Linux command-line WiFi discovery tool. It reads `iw` scan output,
 shows advertised network settings, saves the latest results, and exports CSV reports.
 Use it on your own networks or in environments where you have permission to assess WiFi.
 
-**Version:** 1.1 · **Author:** paul.l
+**Version:** 1.2 · **Author:** paul.l
 
 ## Requirements
 
@@ -68,16 +68,35 @@ The filename `AirRecon.py` is case-sensitive.
 2. Choose **2**, then enter the number of the adapter to scan (for example, `wlo1`).
 3. Read the table of network names, BSSIDs, channels, frequencies, signal levels,
    estimated quality, and security labels.
-4. Choose **3**, then a network number, for details and basic configuration warnings.
+   Networks with configuration warnings are marked, e.g. `[2 warnings]`.
+4. Choose **3**, then a network number, for details and configuration warnings
+   (see **Configuration warnings** below).
 5. Choose **4** to export the full scan to CSV, or **5** to view saved results.
 6. Choose **7** to filter the displayed results by name, exact security label, and
    minimum quality. Filtering does not change saved results or the full-scan report.
 7. Choose **6** to exit. Ctrl+C and end-of-input also exit cleanly.
 
+## Run without the menu
+
+Passing `--interface`, `--json`, or `--csv` runs one scan, saves it like a menu scan,
+and exits. Results (a table, or JSON with `--json`) go to stdout; progress and errors
+go to stderr, so JSON can be piped into other tools. Exit status is 0 on success, 1 if
+the scan or CSV export fails, and 2 for invalid options.
+
+```bash
+sudo python3 AirRecon.py --interface wlo1                    # print the table
+sudo python3 AirRecon.py --interface wlo1 --json > scan.json # machine-readable
+sudo python3 AirRecon.py --interface wlo1 --csv reports/today.csv
+python3 AirRecon.py --input tests/fixtures/sample_scan.txt --json --output-dir /tmp/airrecon-demo
+```
+
+JSON output includes a `Warnings` list for each network; the saved snapshot does not.
+For cron, put the command in root's crontab (`sudo crontab -e`).
+
 ## Try it without scanning
 
-The included sample contains four fictional networks: WPA2, WPA2/WPA3 transition,
-an open network named `SAE Guest`, and a hidden WPA3 network on 6 GHz.
+The included sample contains four fictional networks: WPA2 with WPS and no PMF,
+WPA2/WPA3 transition, an open network named `SAE Guest`, and a hidden WPA3 network on 6 GHz.
 
 ```bash
 cd /path/to/AirRecon
@@ -104,12 +123,33 @@ from replacing your real saved scan. You can also pass a previously captured pla
    scan alone is insufficient to confirm WEP. Enterprise modes can remain ambiguous:
    generic 802.1X is labeled `WPA2/3-Enterprise`; unrecognized authentication stays unknown.
    These labels describe advertised settings, not proof that a network is secure.
-5. Channel analysis counts BSS entries on the same center frequency. It keeps the
+5. Configuration details are read from the same RSN/WPA/WPS sections: protected
+   management frames (`PMF`: Required, Optional, or Disabled), WPS presence, and group
+   and pairwise ciphers. See **Configuration warnings**.
+6. Channel analysis counts BSS entries on the same center frequency. It keeps the
    2.4, 5, and 6 GHz bands separate. It does not measure airtime, channel-width overlap,
    interference, or the number of physical routers.
-6. Successful scans replace the last saved JSON snapshot using an atomic file replacement.
+7. Successful scans replace the last saved JSON snapshot using an atomic file replacement.
    Failed scans preserve previous results. A successful scan finding zero networks saves
    an empty snapshot. If saving fails, the new results remain available in the session.
+
+## Configuration warnings
+
+Warnings are derived only from what the access point advertises:
+
+| Warning | Trigger |
+|---|---|
+| No encryption | Open network (not OWE) |
+| Possibly WEP | Privacy bit without WPA/RSN |
+| Legacy WPA | WPA (v1) advertised, alone or alongside WPA2 |
+| TKIP | TKIP listed as group or pairwise cipher |
+| PMF not required | WPA3, OWE, or 192-bit Enterprise without `MFP-required` |
+| PMF not supported | RSN network with neither `MFP-capable` nor `MFP-required` |
+| WPS advertised | A WPS section is present |
+
+WPA2/WPA3 transition networks are expected to have PMF optional and are not warned for
+it. Results saved by version 1.1 lack these fields and receive no PMF/WPS/cipher warnings
+until rescanned.
 
 ## Files and storage
 
@@ -127,8 +167,11 @@ parent for these directories. Live mode attempts to save raw output before the J
 snapshot; if a file write fails, the raw output and snapshot can differ. The JSON snapshot
 is what **View Saved Results** reads.
 
-Files created with sudo may require sudo to read or update. Use a separate output directory
-for unprivileged demo runs. Reports include the full scan and protect text cells beginning
+When run with sudo, AirRecon hands the files and folders it creates back to the user who
+ran sudo (`SUDO_UID`/`SUDO_GID`), so saved results and reports stay readable without sudo.
+Files left root-owned by version 1.1 are replaced on the next sudo scan, or fix them at once
+with `sudo chown -R $USER: data logs reports`. Use a separate output directory for
+unprivileged demo runs. Reports include the full scan and include PMF, WPS, cipher, and warning columns, and protect text cells beginning
 with spreadsheet formula characters by prefixing an apostrophe. JSON retains the original
 name as represented by `iw`; `iw` escape sequences are not decoded.
 
@@ -158,6 +201,6 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests use synthetic scan output, temporary directories, and mocked `iw` calls. They cover
-parsing, failure recovery, storage, input validation, filtering, CSV export, and a complete
-offline menu session. They do not run wireless scans. Live scanning still depends on your
+parsing, configuration warnings, failure recovery, storage, sudo file ownership, input
+validation, filtering, CSV export, non-interactive mode, and a complete offline menu session. They do not run wireless scans. Live scanning still depends on your
 adapter, driver, privileges, and environment.
