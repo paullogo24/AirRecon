@@ -2,6 +2,7 @@
 """Inspect Linux WiFi scan results using iw or a saved iw scan transcript."""
 
 import argparse
+import contextlib
 import csv
 import json
 import math
@@ -18,7 +19,7 @@ BASE_DIR = Path(__file__).resolve().parent
 NET_DIR = Path('/sys/class/net')
 SCAN_TIMEOUT = 25
 TOOL_NAME = 'AirRecon'
-TOOL_VERSION = '1.1'
+TOOL_VERSION = '1.2'
 MAC = r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}'
 
 
@@ -62,18 +63,84 @@ def freq_to_channel(freq_mhz):
     return None
 
 
-def detect_encryption(cell):
-    # iw prints an RSN/WPA header followed by indented '*' property lines.
+def security_sections(cell):
+    # iw prints an RSN/WPA/WPS header followed by indented '*' property lines.
     # Restrict matching to these sections so SSIDs cannot affect the result.
     sections = {}
-    pattern = r'^[ \t]*(RSN|WPA):[^\n]*(?:\n[ \t]+\*[^\n]*)*'
+    pattern = r'^[ \t]*(RSN|WPA|WPS):[^\n]*(?:\n[ \t]+\*[^\n]*)*'
     for match in re.finditer(pattern, cell, re.MULTILINE):
         sections.setdefault(match.group(1), []).append(match.group(0))
+    return {name: '\n'.join(parts) for name, parts in sections.items()}
+
+
+def cipher_list(text, field):
+    """Unique cipher names from '* Group cipher:' style lines, ignoring '(default)' notes."""
+    names = []
+    for value in re.findall(r'\*[ \t]*' + field + r':[ \t]*([^\n]*)', text):
+        for token in value.split():
+            if not token.startswith('(') and token not in names:
+                names.append(token)
+    return ' '.join(names) or None
+
+
+def security_details(cell):
+    sections = security_sections(cell)
+    rsn = sections.get('RSN')
+    ciphers_from = '\n'.join(sections.get(name, '') for name in ('RSN', 'WPA'))
+    pmf = None
+    if rsn is not None:
+        capabilities = ' '.join(re.findall(r'\*[ \t]*Capabilities:[ \t]*([^\n]*)', rsn))
+        if 'MFP-required' in capabilities:
+            pmf = 'Required'
+        elif 'MFP-capable' in capabilities:
+            pmf = 'Optional'
+        else:
+            pmf = 'Disabled'
+    return {
+        'PMF': pmf,
+        'WPS': 'WPS' in sections,
+        'Group Cipher': cipher_list(ciphers_from, 'Group cipher'),
+        'Pairwise Ciphers': cipher_list(ciphers_from, 'Pairwise ciphers'),
+    }
+
+
+STRICT_PMF_LABELS = ('WPA3', 'Enhanced Open (OWE)', 'WPA3-Enterprise (192-bit)')
+
+
+def security_warnings(net):
+    """Configuration warnings derived from advertised settings only."""
+    enc = net.get('Encryption') or ''
+    warnings = []
+    if enc == 'Open':
+        warnings.append('No WiFi link encryption is advertised.')
+    elif enc.startswith('WEP'):
+        warnings.append('Privacy is advertised without WPA/RSN; possibly legacy WEP. Verify manually.')
+    if 'WPA' in enc.split('/'):
+        warnings.append('Legacy WPA is advertised. Review the router security configuration.')
+    ciphers = f"{net.get('Group Cipher') or ''} {net.get('Pairwise Ciphers') or ''}".split()
+    if 'TKIP' in ciphers:
+        warnings.append('TKIP cipher is advertised; it is deprecated. Use CCMP (AES) only.')
+    # Records saved before PMF parsing existed have no PMF key; do not guess for them.
+    pmf = net.get('PMF')
+    if pmf is not None and pmf != 'Required' and enc in STRICT_PMF_LABELS:
+        warnings.append(f'{enc} requires protected management frames (PMF), '
+                        'but this network does not advertise PMF as required.')
+    elif pmf == 'Disabled':
+        warnings.append('Protected management frames (PMF/802.11w) are not supported; '
+                        'deauthentication frames are unprotected.')
+    if net.get('WPS'):
+        warnings.append('WPS is advertised. PIN-based WPS is open to brute-force attacks; '
+                        'disable WPS if it is not needed.')
+    return warnings
+
+
+def detect_encryption(cell):
+    sections = security_sections(cell)
     labels = []
     if 'WPA' in sections:
         labels.append('WPA')
     if 'RSN' in sections:
-        rsn = '\n'.join(sections['RSN'])
+        rsn = sections['RSN']
         auth = ' '.join(re.findall(r'Authentication suites:[ \t]*([^\n]*)', rsn))
         if re.search(r'\bSAE\b', auth):
             labels.append('WPA2/WPA3' if re.search(r'\bPSK\b', auth) else 'WPA3')
@@ -123,6 +190,7 @@ def parse_network_info(cell):
         'Signal (dBm)': float(signal.group(1)) if signal else None,
         'Signal Level': quality,
         'Quality(%)': quality,
+        **security_details(cell),
     }
 
 
@@ -134,10 +202,43 @@ def parse_scan_output(output):
     return networks
 
 
+def sudo_owner():
+    """The invoking user's (uid, gid) when running as root via sudo, else None."""
+    if os.geteuid() != 0:
+        return None
+    try:
+        return int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID'])
+    except (KeyError, ValueError):
+        return None
+
+
+def give_to_user(path):
+    """Under sudo, hand a created file back to the invoking user so it stays readable."""
+    owner = sudo_owner()
+    if owner:
+        try:
+            os.chown(path, *owner)
+        except OSError:
+            pass
+
+
+def make_dirs(directory):
+    """Create a directory and its parents; under sudo, newly created ones go to the user."""
+    directory = Path(directory)
+    missing = []
+    for candidate in (directory, *directory.parents):
+        if candidate.exists():
+            break
+        missing.append(candidate)
+    directory.mkdir(parents=True, exist_ok=True)
+    for created in missing:
+        give_to_user(created)
+
+
 def atomic_write(path, content):
     """Replace a complete file only after its new contents are written."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_dirs(path.parent)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
@@ -146,6 +247,7 @@ def atomic_write(path, content):
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        give_to_user(temporary)
         os.replace(temporary, path)
     finally:
         if temporary is not None:
@@ -208,16 +310,22 @@ def safe_text(value, fallback='—'):
 
 
 def save_to_csv(networks, filename='wifi_results.csv'):
-    fields = ['ESSID', 'BSSID', 'Channel', 'Frequency', 'Signal (dBm)', 'Quality(%)', 'Encryption']
+    fields = ['ESSID', 'BSSID', 'Channel', 'Frequency', 'Signal (dBm)', 'Quality(%)', 'Encryption',
+              'PMF', 'WPS', 'Group Cipher', 'Pairwise Ciphers', 'Warnings']
     path = Path(filename)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_dirs(path.parent)
     with path.open('w', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for net in networks:
             row = {}
             for field in fields:
-                value = net.get(field)
+                if field == 'Warnings':
+                    value = '; '.join(security_warnings(net))
+                elif field == 'WPS':
+                    value = {True: 'Yes', False: 'No'}.get(net.get('WPS'), '')
+                else:
+                    value = net.get(field)
                 if isinstance(value, str):
                     value = safe_text(value)
                     # Names are untrusted spreadsheet data, not formulas.
@@ -225,6 +333,7 @@ def save_to_csv(networks, filename='wifi_results.csv'):
                         value = "'" + value
                 row[field] = value
             writer.writerow(row)
+    give_to_user(path)
 
 
 def display_results(networks):
@@ -239,15 +348,18 @@ def display_results(networks):
             name = name[:24] + '…'
         values = [safe_text(net.get(key)) for key in
                   ('BSSID', 'Channel', 'Frequency', 'Signal (dBm)', 'Quality(%)', 'Encryption')]
+        count = len(security_warnings(net))
+        flag = f'  [{count} warning{"s" if count > 1 else ""}]' if count else ''
         print(f'{i:<4} {name:<26} {values[0]:<18} {values[1]:<4} {values[2]:<11} '
-              f'{values[3]:<7} {values[4]:<9} {values[5]}')
+              f'{values[3]:<7} {values[4]:<9} {values[5]}{flag}')
 
 
 def log_message(message):
     try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        make_dirs(LOG_FILE.parent)
         with LOG_FILE.open('a', encoding='utf-8') as handle:
             handle.write(f'[{datetime.now().isoformat(timespec="seconds")}] {safe_text(message)}\n')
+        give_to_user(LOG_FILE)
     except OSError as exc:
         print(f'[!] Could not write log: {exc}')
 
@@ -262,9 +374,12 @@ def validate_results(networks):
     for net in networks:
         if not isinstance(net, dict) or not re.fullmatch(MAC, str(net.get('BSSID', ''))):
             raise ValueError('A network record has an invalid or missing BSSID.')
-        for field in ('ESSID', 'Channel', 'Frequency', 'Encryption'):
+        for field in ('ESSID', 'Channel', 'Frequency', 'Encryption',
+                      'PMF', 'Group Cipher', 'Pairwise Ciphers'):
             if net.get(field) is not None and not isinstance(net[field], str):
                 raise ValueError(f'Invalid {field} in a network record.')
+        if net.get('WPS') is not None and not isinstance(net['WPS'], bool):
+            raise ValueError('Invalid WPS in a network record.')
         net['ESSID'] = net.get('ESSID') or ''
         net['Encryption'] = net.get('Encryption') or 'Unknown'
         net.setdefault('Quality(%)', net.get('Signal Level'))
@@ -310,6 +425,53 @@ def current_results(state):
     return load_results() if state.get('networks') is None else state['networks']
 
 
+def acquire_networks(source=None, interface=None):
+    """Parse a saved iw transcript when source is given, otherwise scan the interface."""
+    if source is not None:
+        networks = parse_scan_output(Path(source).read_text(encoding='utf-8'))
+        print(f'[*] Loaded offline scan: {source}')
+        return networks
+    return scan_wifi(interface)
+
+
+def export_records(networks):
+    return [dict(net, Warnings=security_warnings(net)) for net in networks]
+
+
+def run_batch(args):
+    """Non-interactive run: scan once, save, optionally export, then exit.
+
+    Results (table or JSON) go to stdout; progress and errors go to stderr,
+    so `--json` output can be piped straight into other tools.
+    """
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            networks = acquire_networks(args.input, args.interface)
+        except (ScanError, OSError, UnicodeError) as exc:
+            print(f'[!] Scan failed: {exc}\nPrevious results were preserved.')
+            log_message(f'Scan failed: {exc}')
+            return 1
+        try:
+            save_results(networks)
+        except OSError as exc:
+            print(f'[!] Could not save results: {exc}')
+        log_message(f'Scanned {args.input or args.interface}; found {len(networks)} networks.')
+        print(f'[+] Found {len(networks)} networks.')
+        if args.csv:
+            try:
+                save_to_csv(networks, args.csv)
+            except OSError as exc:
+                print(f'[!] Could not write CSV report: {exc}')
+                return 1
+            log_message(f'Saved CSV report to {args.csv}')
+            print(f'[+] Report saved to {args.csv}')
+    if args.json:
+        print(json.dumps(export_records(networks), indent=2, allow_nan=False))
+    else:
+        display_results(networks)
+    return 0
+
+
 def handle_scan(state):
     source = state.get('input_file')
     interface = None
@@ -318,11 +480,7 @@ def handle_scan(state):
         if interface is None:
             return
     try:
-        if source is not None:
-            networks = parse_scan_output(Path(source).read_text(encoding='utf-8'))
-            print(f'[*] Loaded offline scan: {source}')
-        else:
-            networks = scan_wifi(interface)
+        networks = acquire_networks(source, interface)
     except (ScanError, OSError, UnicodeError) as exc:
         print(f'[!] Scan failed: {exc}\nPrevious results were preserved.')
         log_message(f'Scan failed: {exc}')
@@ -355,15 +513,13 @@ def handle_analyze(state):
         return
     net = networks[idx]
     print(f'\nNetwork: {safe_text(net.get("ESSID") or "(hidden)")}')
-    for field in ('BSSID', 'Channel', 'Frequency', 'Encryption', 'Signal (dBm)', 'Quality(%)'):
+    for field in ('BSSID', 'Channel', 'Frequency', 'Encryption', 'Signal (dBm)', 'Quality(%)',
+                  'PMF', 'Group Cipher', 'Pairwise Ciphers'):
         print(f'  {field}: {safe_text(net.get(field))}')
-    enc = net.get('Encryption', '')
-    if enc == 'Open':
-        print('  [!] No WiFi link encryption is advertised.')
-    elif enc in ('WEP', 'WEP/unknown'):
-        print('  [!] Privacy is advertised without WPA/RSN; possibly legacy WEP. Verify manually.')
-    elif enc == 'WPA':
-        print('  [!] Legacy WPA is advertised. Review the router security configuration.')
+    if 'WPS' in net:
+        print(f'  WPS: {"Advertised" if net["WPS"] else "Not advertised"}')
+    for warning in security_warnings(net):
+        print(f'  [!] {warning}')
     frequency = net.get('Frequency')
     count = analyze_channels(networks).get(frequency, 0)
     if count > 1:
@@ -421,8 +577,23 @@ def main(argv=None):
     parser.add_argument('--input', type=Path, help='Read saved iw scan output instead of scanning hardware.')
     parser.add_argument('--output-dir', type=Path, default=BASE_DIR,
                         help='Parent of data/, logs/, and reports/ (default: script directory).')
+    batch = parser.add_argument_group(
+        'non-interactive mode',
+        'Any of these options runs one scan without the menu, then exits '
+        '(status 0 on success, 1 if the scan or CSV export fails).')
+    batch.add_argument('--interface', metavar='IFACE',
+                       help='Scan this wireless adapter (e.g. wlo1) without the menu.')
+    batch.add_argument('--json', action='store_true',
+                       help='Print results, including warnings, as JSON on stdout.')
+    batch.add_argument('--csv', type=Path, metavar='PATH', help='Write a CSV report to PATH.')
     args = parser.parse_args(argv)
+    if args.input is not None and args.interface:
+        parser.error('use either --input or --interface, not both')
     configure_storage(args.output_dir)
+    if args.interface or args.json or args.csv:
+        if args.input is None and not args.interface:
+            parser.error('--json and --csv need --interface IFACE or --input FILE')
+        return run_batch(args)
     state = {'networks': None, 'input_file': args.input}
     print(f'Results directory: {DATA_DIR.parent}')
     try:
