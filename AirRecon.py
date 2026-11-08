@@ -169,6 +169,11 @@ def calculate_signal(signal_match):
     return int(max(0, min(100, 2 * (dbm + 100))))
 
 
+def normalize_ssid(raw):
+    # Hidden networks often broadcast a zero-filled name, which iw prints as \x00 escapes.
+    return '' if re.fullmatch(r'(?:\\x00)+', raw.strip()) else raw
+
+
 def parse_network_info(cell):
     bssid = re.search(r'^BSS (' + MAC + r')(?=[(\s]|$)', cell, re.MULTILINE)
     if not bssid:
@@ -183,12 +188,11 @@ def parse_network_info(cell):
     quality = calculate_signal(signal)
     return {
         'BSSID': bssid.group(1).lower(),
-        'ESSID': ssid.group(1) if ssid else '',
+        'ESSID': normalize_ssid(ssid.group(1)) if ssid else '',
         'Frequency': f'{mhz / 1000:.3f} GHz' if mhz is not None else None,
         'Channel': str(channel) if channel is not None else None,
         'Encryption': detect_encryption(cell),
         'Signal (dBm)': float(signal.group(1)) if signal else None,
-        'Signal Level': quality,
         'Quality(%)': quality,
         **security_details(cell),
     }
@@ -254,12 +258,11 @@ def atomic_write(path, content):
             temporary.unlink(missing_ok=True)
 
 
-def scan_wifi(interface, timeout=SCAN_TIMEOUT):
-    print(f'[*] Scanning on {interface}...')
+def run_iw(interface, command, timeout):
     try:
-        result = subprocess.run(['iw', 'dev', interface, 'scan'],
-                                capture_output=True, text=True, errors='replace',
-                                timeout=timeout)
+        return subprocess.run(['iw', 'dev', interface, *command],
+                              capture_output=True, text=True, errors='replace',
+                              timeout=timeout)
     except FileNotFoundError as exc:
         raise ScanError('Install iw: sudo dnf install iw (Fedora), '
                         'or sudo apt install iw (Debian/Ubuntu).') from exc
@@ -267,21 +270,41 @@ def scan_wifi(interface, timeout=SCAN_TIMEOUT):
         raise ScanError(f'Scan timed out after {timeout} seconds. Try again.') from exc
     except OSError as exc:
         raise ScanError(f'Cannot run iw: {exc}') from exc
+
+
+def scan_wifi(interface, timeout=SCAN_TIMEOUT):
+    """Trigger a fresh scan; if iw refuses, fall back to the kernel's cached results.
+
+    `iw scan` needs root and fails while another program is scanning, but
+    `iw scan dump` returns what the system (e.g. NetworkManager) last found and
+    usually works without sudo. An empty cache is not treated as a success,
+    so a failed scan never replaces saved results with nothing.
+    """
+    print(f'[*] Scanning on {interface}...')
+    result = run_iw(interface, ['scan'], timeout)
+    networks = None
     if result.returncode:
         detail = result.stderr.strip() or f'iw exited with status {result.returncode}'
-        raise ScanError(f'{detail}. Check permissions, WiFi/rfkill, and whether '
-                        'another scan is running. Live scans usually need sudo.')
-    networks = parse_scan_output(result.stdout)
+        cached = run_iw(interface, ['scan', 'dump'], timeout)
+        if not cached.returncode:
+            try:
+                networks = parse_scan_output(cached.stdout)
+            except ScanError:
+                networks = None
+        if not networks:
+            raise ScanError(f'{detail}. Check permissions, WiFi/rfkill, and whether '
+                            'another scan is running. Live scans usually need sudo.')
+        result = cached
+        print(f'[*] Fresh scan unavailable ({detail}); showing cached results from the '
+              'last system scan. These may be incomplete; run with sudo for a full scan.')
+        log_message(f'Fresh scan on {interface} failed ({detail}); used cached scan dump.')
+    else:
+        networks = parse_scan_output(result.stdout)
     try:
         atomic_write(RAW_FILE, result.stdout)
     except OSError as exc:
         print(f'[!] Could not save raw scan output: {exc}')
     return networks
-
-
-def analyze_signal(networks):
-    for net in networks:
-        net['Quality(%)'] = net.get('Signal Level')
 
 
 def analyze_channels(networks):
@@ -390,6 +413,7 @@ def validate_results(networks):
                 raise ValueError(f'Invalid {field} in a network record.')
             if field != 'Signal (dBm)' and value is not None and not 0 <= value <= 100:
                 raise ValueError(f'{field} must be between 0 and 100.')
+        net.pop('Signal Level', None)  # pre-1.2 duplicate of Quality(%)
     return networks
 
 
@@ -568,8 +592,8 @@ def show_menu(offline=False):
     print('3. Analyze Selected Network')
     print('4. Generate Report (CSV)')
     print('5. View Saved Results')
-    print('6. Exit')
-    print('7. Filter Networks')
+    print('6. Filter Networks')
+    print('7. Exit')
 
 
 def main(argv=None):
@@ -600,7 +624,7 @@ def main(argv=None):
         while True:
             show_menu(args.input is not None)
             choice = input('Select an option: ').strip()
-            if choice == '6':
+            if choice in ('7', '0', 'q', 'Q'):
                 print('Goodbye!')
                 return 0
             try:
@@ -615,7 +639,7 @@ def main(argv=None):
                     handle_report(state)
                 elif choice == '5':
                     display_results(load_results())
-                elif choice == '7':
+                elif choice == '6':
                     handle_filter(state)
                 else:
                     print('[!] Invalid option.')
