@@ -180,6 +180,7 @@ class AirReconTests(unittest.TestCase):
         self.assertEqual(loaded['Quality(%)'], 75)
         self.assertEqual(loaded['ESSID'], '')
         self.assertEqual(loaded['Encryption'], 'Unknown')
+        self.assertNotIn('Signal Level', loaded)
         app.display_results([loaded])
 
     def test_invalid_saved_data_is_reported_without_crashing(self):
@@ -230,7 +231,7 @@ class AirReconTests(unittest.TestCase):
 
     def test_full_offline_menu_from_another_directory(self):
         # Scan, analyze, export, reload, filter, then exit in a separate process.
-        commands = '2\n\n3\n1\n\n4\n\n5\n\n7\nExample\nWPA2\n80\n\n6\n'
+        commands = '2\n\n3\n1\n\n4\n\n5\n\n6\nExample\nWPA2\n80\n\n7\n'
         result = subprocess.run([sys.executable, str(app.BASE_DIR / 'AirRecon.py'),
                                  '--input', str(FIXTURE.resolve()), '--output-dir', str(self.root)],
                                 input=commands, capture_output=True, text=True,
@@ -254,6 +255,54 @@ class AirReconTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stderr, '')
         self.assertIn('Goodbye!', result.stdout)
+
+    def test_zero_filled_ssid_is_hidden(self):
+        for raw, expected in [('\\x00', ''), ('\\x00\\x00\\x00\\x00', ''),
+                              ('a\\x00', 'a\\x00'), ('\\x01', '\\x01')]:
+            with self.subTest(raw=raw):
+                cell = f'BSS 02:00:00:00:00:01(on wlan0)\n\tSSID: {raw}\n'
+                self.assertEqual(app.parse_network_info(cell)['ESSID'], expected)
+        app.display_results([app.parse_network_info(
+            'BSS 02:00:00:00:00:01(on wlan0)\n\tSSID: \\x00\\x00\n')])
+        self.assertIn('(hidden)', self.console.getvalue())
+
+    def test_new_records_have_no_duplicate_signal_level(self):
+        self.assertNotIn('Signal Level', self.networks[0])
+
+    def test_menu_exit_aliases(self):
+        for exit_choice in ('7', '0', 'q'):
+            with self.subTest(choice=exit_choice), patch('builtins.input', side_effect=[exit_choice]):
+                self.assertEqual(app.main(['--output-dir', str(self.root)]), 0)
+
+    # --- Cached scan fallback -----------------------------------------------------
+
+    def test_failed_fresh_scan_falls_back_to_cached_dump(self):
+        refused = subprocess.CompletedProcess([], 255, '', 'command failed: Operation not permitted (-1)')
+        cached = subprocess.CompletedProcess([], 0, self.raw, '')
+        with patch.object(app.subprocess, 'run', side_effect=[refused, cached]) as run:
+            self.assertEqual(app.scan_wifi('wlan0'), self.networks)
+        self.assertEqual([c.args[0] for c in run.call_args_list],
+                         [['iw', 'dev', 'wlan0', 'scan'], ['iw', 'dev', 'wlan0', 'scan', 'dump']])
+        self.assertIn('cached results', self.console.getvalue())
+        self.assertEqual(app.RAW_FILE.read_text(), self.raw)
+        self.assertIn('used cached scan dump', app.LOG_FILE.read_text())
+
+    def test_empty_or_failed_cache_reports_original_error(self):
+        refused = subprocess.CompletedProcess([], 240, '', 'command failed: Device or resource busy (-16)')
+        for dump in (subprocess.CompletedProcess([], 0, '', ''),
+                     subprocess.CompletedProcess([], 0, 'garbage', ''),
+                     subprocess.CompletedProcess([], 1, '', 'nope')):
+            with self.subTest(dump=dump.stdout or dump.stderr), \
+                 patch.object(app.subprocess, 'run', side_effect=[refused, dump]):
+                with self.assertRaisesRegex(app.ScanError, 'resource busy'):
+                    app.scan_wifi('wlan0')
+        self.assertFalse(app.RAW_FILE.exists())
+
+    def test_successful_fresh_scan_does_not_dump(self):
+        result = subprocess.CompletedProcess([], 0, '', '')
+        with patch.object(app.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(app.scan_wifi('wlan0'), [])
+        self.assertEqual(run.call_count, 1)
 
     # --- Security configuration details -------------------------------------------
 

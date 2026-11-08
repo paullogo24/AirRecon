@@ -10,7 +10,9 @@ Use it on your own networks or in environments where you have permission to asse
 
 - Python 3.9 or newer; no third-party Python packages or virtual environment needed.
 - For live scans: Linux, a WiFi adapter with a working driver, and `iw`.
-- Live scans usually require root privileges. Offline mode needs neither `iw` nor sudo.
+- A fresh live scan usually requires root privileges. Without sudo, AirRecon falls back
+  to the system's cached results (see **How it works**). Offline mode needs neither `iw`
+  nor sudo.
 
 Install `iw` if necessary:
 
@@ -72,9 +74,9 @@ The filename `AirRecon.py` is case-sensitive.
 4. Choose **3**, then a network number, for details and configuration warnings
    (see **Configuration warnings** below).
 5. Choose **4** to export the full scan to CSV, or **5** to view saved results.
-6. Choose **7** to filter the displayed results by name, exact security label, and
+6. Choose **6** to filter the displayed results by name, exact security label, and
    minimum quality. Filtering does not change saved results or the full-scan report.
-7. Choose **6** to exit. Ctrl+C and end-of-input also exit cleanly.
+7. Choose **7** (or `0` / `q`) to exit. Ctrl+C and end-of-input also exit cleanly.
 
 ## Run without the menu
 
@@ -113,7 +115,13 @@ from replacing your real saved scan. You can also pass a previously captured pla
 1. Live mode discovers wireless adapters through `/sys/class/net` and runs
    `iw dev INTERFACE scan`, with a 25-second timeout. It does not change adapter mode,
    connect to a network, or change router settings. The driver may send probe requests.
-2. Each `BSS` block becomes a network record, including hidden SSIDs. The parser reads
+   If the fresh scan is refused (no sudo, or another program is scanning), AirRecon reads
+   the kernel's cached results with `iw dev INTERFACE scan dump`, which usually works
+   without root. The cache holds whatever the system last saw, so it can be stale or
+   contain only a few networks, often just the one you are connected to. If the cache is
+   empty, the original error is reported and saved results are kept.
+2. Each `BSS` block becomes a network record, including hidden SSIDs. Names broadcast
+   as all zero bytes (`\x00\x00…`) are treated as hidden. The parser reads
    frequencies, dBm signal values, and RSN/WPA security fields. Network names cannot
    change the security classification.
 3. Quality is an estimate: `clamp(2 × (dBm + 100), 0, 100)`. For example, −75 dBm becomes
@@ -182,7 +190,8 @@ longer use them for other work.
 ## Troubleshooting
 
 - **`iw` not found:** install it with the command above.
-- **Operation not permitted:** run live mode with sudo from your terminal.
+- **Operation not permitted:** run live mode with sudo from your terminal. Without sudo you
+  get the cached fallback, which may list only a few networks.
 - **No wireless interfaces:** confirm the adapter and driver are available. Containers
   and virtual machines may not expose the host WiFi device.
 - **Failed to connect to generic netlink:** the environment may restrict kernel network
